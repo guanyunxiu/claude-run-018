@@ -20,21 +20,31 @@ import fsp from 'node:fs/promises';
 import { getPool } from '../db.js';
 import { config } from '../config.js';
 import { sha256Hex, aggregateHashHex } from '../hash.js';
+import { getLocker } from '../store/locker.js';
 import {
   writeCasChunk,
+  writeCasChunkIfAbsent,
   readCasChunk,
   casChunkRelPath,
   casChunkPhysicalOk,
   mergeCasChunks,
+  mergedBlobExists,
   createMergedReadStream,
   mergedBlobAbs,
   safeFileId,
   safeBaseName,
 } from '../storage.js';
+import { ensureCasChunk, releaseOneRef } from '../services/cas.js';
 
 const router = express.Router();
 
 const HASH_RE = /^[a-f0-9]{64}$/i;
+
+function isLeaseExpired(leaseUntil) {
+  if (!leaseUntil) return true; // 无租约信息的旧 merging 行可被接管
+  const t = new Date(leaseUntil).getTime();
+  return Number.isFinite(t) ? t <= Date.now() : true;
+}
 
 function apiError(status, code, message, details) {
   const err = new Error(message);
@@ -685,87 +695,27 @@ router.post(
         [fileId, index],
       );
 
-      // CAS 全局分片：锁行。存在时必须确认物理可读，否则用本次请求体重写（自愈幽灵片）。
-      const [casRows] = await conn.query(
-        'SELECT * FROM cas_chunks WHERE chunk_hash = ? FOR UPDATE',
-        [expectedHash],
-      );
-      let casExisted = casRows.length > 0;
-      let healed = false;
-      if (casExisted) {
-        // 库行存在 ≠ 物理文件健康：GC 中途崩溃/磁盘位翻转可能造成“有行无 .part”。
-        const physicalOk = await casChunkPhysicalOk(expectedHash, casRows[0].chunk_size);
-        if (physicalOk) {
-          await conn.query(
-            'UPDATE cas_chunks SET ref_count = ref_count + 1 WHERE chunk_hash = ?',
-            [expectedHash],
-          );
-        } else {
-          // 自愈：用本次上传的字节原子重写物理文件，再补计数（行可能 ref_count=0）
-          await writeCasChunk(expectedHash, body);
-          healed = true;
-          await conn.query(
-            `UPDATE cas_chunks
-                SET chunk_size = ?, storage_path = ?, ref_count = ref_count + 1
-              WHERE chunk_hash = ?`,
-            [body.length, casChunkRelPath(expectedHash), expectedHash],
-          );
-        }
-      } else {
-        // 全局首传：先原子落盘（哈希已在上方校验），再插入元数据。
-        // 并发首传时唯一键可能冲突——交由唯一键兜底，catch 后走“已存在”分支。
-        const relPath = casChunkRelPath(expectedHash);
-        await writeCasChunk(expectedHash, body);
-        try {
-          await conn.query(
-            `INSERT INTO cas_chunks (chunk_hash, chunk_size, storage_path, ref_count)
-             VALUES (?, ?, ?, 1)`,
-            [expectedHash, body.length, relPath],
-          );
-        } catch (insErr) {
-          if (insErr.code === 'ER_DUP_ENTRY') {
-            casExisted = true;
-            // 并发下另一个请求已建行；同样要先验盘（防共享幽灵行），缺失则重写
-            const [rival] = await conn.query(
-              'SELECT chunk_size FROM cas_chunks WHERE chunk_hash = ? FOR UPDATE',
-              [expectedHash],
-            );
-            if (!(await casChunkPhysicalOk(expectedHash, rival[0]?.chunk_size))) {
-              await writeCasChunk(expectedHash, body);
-              healed = true;
-            }
-            // ref_count 已被对方置 1，本请求仍需占 1 个引用
-            await conn.query(
-              'UPDATE cas_chunks SET ref_count = ref_count + 1 WHERE chunk_hash = ?',
-              [expectedHash],
-            );
-          } else {
-            throw insErr;
-          }
-        }
-      }
+      // 跨机器保证对象+行+引用一致（锁 + 对象条件写 + DB 唯一键），并自愈幽灵片
+      const locker = await getLocker();
+      const casResult = await ensureCasChunk({ conn, hash: expectedHash, body, locker });
+      let casExisted = casResult.existed;
+      const healed = casResult.healed;
 
       // 建立/替换本文件关联
       let skipped = false;
       if (oldLinks.length > 0) {
         const old = oldLinks[0];
         if (old.chunk_hash === expectedHash) {
-          // 幂等：同序号同哈希——撤销刚才多 +1 的引用
+          // 幂等：同序号同哈希——撤销 ensureCasChunk 多 +1 的引用
           skipped = true;
-          await conn.query(
-            'UPDATE cas_chunks SET ref_count = GREATEST(ref_count - 1, 0) WHERE chunk_hash = ?',
-            [expectedHash],
-          );
+          await releaseOneRef(conn, expectedHash);
         } else {
           // 内容变了：替换关联，旧分片引用 -1
           await conn.query(
             `UPDATE file_chunks SET chunk_hash = ?, status = 'uploaded' WHERE id = ?`,
             [expectedHash, old.id],
           );
-          await conn.query(
-            'UPDATE cas_chunks SET ref_count = GREATEST(ref_count - 1, 0) WHERE chunk_hash = ?',
-            [old.chunk_hash],
-          );
+          await releaseOneRef(conn, old.chunk_hash);
         }
       } else {
         await conn.query(
@@ -781,7 +731,7 @@ router.post(
         hash: expectedHash,
         size: body.length,
         skipped,
-        dedup: casExisted && !healed,
+        dedup: casResult.dedup,
         healed,
       });
     } catch (err) {
@@ -828,59 +778,49 @@ router.post(
           totalChunks: file.total_chunks,
         });
 
-      // CAS 物理分片必须已存在（ref_count>0）且物理可读；不接受字节，不写盘
-      const [casRows] = await conn.query(
-        'SELECT * FROM cas_chunks WHERE chunk_hash = ? FOR UPDATE',
-        [hash],
-      );
-      if (casRows.length === 0) {
-        throw apiError(
-          409,
-          'CAS_CHUNK_NOT_FOUND',
-          '该分片内容在全局 CAS 中不存在，不能只关联，请走分片上传',
-          { index, hash },
-        );
-      }
-      const cas = casRows[0];
-      try {
-        const st = await fsp.stat(path.join(config.storageDir, cas.storage_path));
-        if (BigInt(st.size) !== BigInt(cas.chunk_size)) {
-          throw new Error('物理分片大小与记录不符');
-        }
-      } catch {
-        throw apiError(
-          409,
-          'CHUNK_FILE_MISSING',
-          'CAS 物理分片缺失或损坏，不能只关联，请走分片上传',
-          { index, hash },
-        );
-      }
-
+      // 只关联：对象与行必须已存在且可读。ensureCasChunk 不传字节，
+      // 缺失/幽灵时抛 CAS_CHUNK_NOT_FOUND / CHUNK_FILE_MISSING，前端回退字节上传。
       const [oldLinks] = await conn.query(
         'SELECT id, chunk_hash FROM file_chunks WHERE file_id = ? AND chunk_index = ? FOR UPDATE',
         [fileId, index],
       );
 
       let skipped = false;
+      let casSize;
       if (oldLinks.length > 0 && oldLinks[0].chunk_hash === hash) {
-        // 幂等：本文件该序号已关联同一 CAS 分片，引用计数不动
-        skipped = true;
-      } else {
-        // 新关联：CAS 引用 +1
-        await conn.query(
-          'UPDATE cas_chunks SET ref_count = ref_count + 1 WHERE chunk_hash = ?',
+        // 幂等：本文件该序号已关联同一 CAS 分片，引用计数不动；仍要确认对象可读
+        const [rows] = await conn.query(
+          'SELECT chunk_size FROM cas_chunks WHERE chunk_hash = ? FOR UPDATE',
           [hash],
         );
+        if (rows.length === 0 || !(await casChunkPhysicalOk(hash, rows[0].chunk_size))) {
+          throw apiError(
+            409,
+            'CHUNK_FILE_MISSING',
+            '已关联的 CAS 物理分片缺失，请改走字节上传自愈',
+            { index, hash },
+          );
+        }
+        casSize = rows[0].chunk_size;
+        skipped = true;
+      } else {
+        const locker = await getLocker();
+        try {
+          const r = await ensureCasChunk({ conn, hash, body: null, locker });
+          casSize = r;
+        } catch (e) {
+          if (e.status === 409) {
+            throw apiError(e.status, e.code, e.message, { ...(e.details || {}), index });
+          }
+          throw e;
+        }
         if (oldLinks.length > 0) {
-          // 旧关联是不同内容：替换并回收旧引用
+          // 旧关联是不同内容：替换并回收旧引用（ensure 已给新哈希 +1）
           await conn.query(
             `UPDATE file_chunks SET chunk_hash = ?, status = 'uploaded' WHERE id = ?`,
             [hash, oldLinks[0].id],
           );
-          await conn.query(
-            'UPDATE cas_chunks SET ref_count = GREATEST(ref_count - 1, 0) WHERE chunk_hash = ?',
-            [oldLinks[0].chunk_hash],
-          );
+          await releaseOneRef(conn, oldLinks[0].chunk_hash);
         } else {
           await conn.query(
             `INSERT INTO file_chunks (file_id, chunk_index, chunk_hash, status)
@@ -888,13 +828,18 @@ router.post(
             [fileId, index, hash],
           );
         }
+        const [rows] = await conn.query(
+          'SELECT chunk_size FROM cas_chunks WHERE chunk_hash = ?',
+          [hash],
+        );
+        casSize = rows[0]?.chunk_size;
       }
 
       await conn.commit();
       res.status(skipped ? 200 : 201).json({
         index,
         hash,
-        size: Number(cas.chunk_size),
+        size: Number(casSize),
         skipped,
         linked: true,
       });
@@ -915,35 +860,54 @@ router.post(
   asyncHandler(async (req, res) => {
     const fileId = safeFileId(req.params.fileId);
     const pool = getPool();
+    const locker = await getLocker();
 
-    const [files] = await pool.query('SELECT * FROM files WHERE id = ?', [fileId]);
-    if (files.length === 0) throw apiError(404, 'FILE_NOT_FOUND', '文件任务不存在');
-    const file = files[0];
-    if (file.status === 'completed')
-      throw apiError(409, 'FILE_ALREADY_VERIFIED', '文件已完成校验');
-    if (file.status === 'merging')
-      throw apiError(409, 'FILE_VERIFYING', '文件正在聚合校验中，请勿重复提交');
-    if (!file.file_hash)
-      throw apiError(
-        409,
-        'FILE_HASH_REQUIRED',
-        '聚合哈希尚未提交，请先 POST /hash 或在 init 带清单',
-      );
-
-    // 原子抢占 uploading → merging
-    const [claim] = await pool.query(
-      "UPDATE files SET status = 'merging' WHERE id = ? AND status = 'uploading'",
-      [fileId],
-    );
-    if (claim.affectedRows === 0) {
-      throw apiError(409, 'FILE_VERIFYING', '文件正在聚合校验中，请勿重复提交 complete');
+    // 跨机器串行化同一文件的合并：双机同时点完成，只有一个能拿到锁进入。
+    const mergeLock = locker
+      ? await locker.acquire(`merge:${fileId}`, { waitMs: 0, ttlMs: Math.max(config.lock.ttlMs, 120_000) })
+      : null;
+    if (!mergeLock && locker) {
+      throw apiError(409, 'FILE_VERIFYING', '另一台实例正在合并该文件，请勿重复提交 complete');
     }
-
-    const resetToUploading = async () => {
-      await pool.query("UPDATE files SET status = 'uploading' WHERE id = ?", [fileId]);
-    };
-
     try {
+      const [files] = await pool.query('SELECT * FROM files WHERE id = ?', [fileId]);
+      if (files.length === 0) throw apiError(404, 'FILE_NOT_FOUND', '文件任务不存在');
+      const file = files[0];
+      if (file.status === 'completed')
+        throw apiError(409, 'FILE_ALREADY_VERIFIED', '文件已完成校验');
+      if (file.status === 'merging' && !isLeaseExpired(file.merge_lease_until)) {
+        throw apiError(409, 'FILE_VERIFYING', '文件正在聚合校验中，请勿重复提交');
+      }
+      if (!file.file_hash)
+        throw apiError(
+          409,
+          'FILE_HASH_REQUIRED',
+          '聚合哈希尚未提交，请先 POST /hash 或在 init 带清单',
+        );
+
+      // 原子抢占：uploading→merging；或接管租约已过期的卡死 merging（崩溃恢复）
+      const owner = `${process.env.HOSTNAME || 'node'}:${process.pid}`;
+      const leaseMs = Math.max(config.lock.ttlMs, 120_000);
+      const leaseUntil = new Date(Date.now() + leaseMs);
+      const [claim] = await pool.query(
+        `UPDATE files
+            SET status='merging', merge_owner=?, merge_lease_until=?
+          WHERE id=? AND (status='uploading'
+                          OR (status='merging' AND (merge_lease_until IS NULL OR merge_lease_until < NOW(3))))`,
+        [owner, leaseUntil, fileId],
+      );
+      if (claim.affectedRows === 0) {
+        throw apiError(409, 'FILE_VERIFYING', '文件正在聚合校验中，请勿重复提交 complete');
+      }
+
+      const resetToUploading = async () => {
+        await pool.query(
+          `UPDATE files SET status='uploading', merge_owner=NULL, merge_lease_until=NULL
+            WHERE id=? AND status='merging'`,
+          [fileId],
+        );
+      };
+
       const [rows] = await pool.query(
         `SELECT fc.chunk_index, fc.chunk_hash, cc.chunk_size AS cas_size, cc.storage_path
            FROM file_chunks fc
@@ -981,7 +945,8 @@ router.post(
         const abs = path.join(config.storageDir, row.storage_path);
         let buf;
         try {
-          await fsp.access(abs);
+          // 统一走对象存储抽象（local 或 S3），不直接访问本机文件系统
+          void abs;
           buf = await readCasChunk(row.chunk_hash);
         } catch {
           await resetToUploading();
@@ -1040,7 +1005,10 @@ router.post(
           fileId,
         ]);
         await conn.query(
-          `UPDATE files SET status = 'completed', merged_hash = ?, merged_path = ? WHERE id = ?`,
+          `UPDATE files
+              SET status = 'completed', merged_hash = ?, merged_path = ?,
+                  merge_owner = NULL, merge_lease_until = NULL
+            WHERE id = ?`,
           [merged.mergedHash, merged.relPath, fileId],
         );
         await conn.commit();
@@ -1068,6 +1036,8 @@ router.post(
           .catch(() => {});
       }
       throw err;
+    } finally {
+      if (mergeLock) await mergeLock.release();
     }
   }),
 );
@@ -1153,11 +1123,12 @@ router.get(
       throw apiError(409, 'FILE_NOT_READY', '文件尚未完成校验，无法下载');
     }
     const abs = mergedBlobAbs(file.merged_hash);
-    try {
-      await fsp.access(abs);
-    } catch {
-      throw apiError(410, 'MERGED_BLOB_MISSING', '合并产物物理文件缺失');
+    // 统一通过对象存储抽象校验可读（local 查文件系统，S3 查 HEAD）
+    const ok = await mergedBlobExists(file.merged_hash);
+    if (!ok) {
+      throw apiError(410, 'MERGED_BLOB_MISSING', '合并产物在对象存储中缺失');
     }
+    void abs;
     const downloadName = encodeURIComponent(safeBaseName(file.file_name));
     res.setHeader('Content-Type', 'application/octet-stream');
     res.setHeader(

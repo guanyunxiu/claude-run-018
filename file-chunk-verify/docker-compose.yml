@@ -1,7 +1,9 @@
+# 多机分布式部署：2 个后端 + MySQL + MinIO（S3）+ Redis
+# 两台 API 共用同一套对象存储（MinIO bucket）、同一个 MySQL、同一把 Redis 锁，
+# 任意一台都能处理上传/秒传/合并/GC，结果一致。
 services:
   mysql:
     image: mysql:8.0
-    container_name: chunk-verify-mysql
     command: --character-set-server=utf8mb4 --collation-server=utf8mb4_unicode_ci
     environment:
       MYSQL_ROOT_PASSWORD: root
@@ -10,13 +12,110 @@ services:
       - "3306:3306"
     volumes:
       - mysql-data:/var/lib/mysql
-      # 首次启动自动导入建表脚本（database 由 MYSQL_DATABASE 自动创建）
-      - ./server/sql/schema.sql:/docker-entrypoint-initdb.d/01-schema.sql:ro
     healthcheck:
-      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-uroot", "-proot"]
+      test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "-uroot", "-proot"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  minio:
+    image: minio/minio:latest
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    ports:
+      - "9000:9000"   # S3 API
+      - "9001:9001"   # Web Console
+    volumes:
+      - minio-data:/data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://127.0.0.1:9000/minio/health/live"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  # 一次性任务：等 MinIO 就绪后创建 bucket（幂等）
+  minio-init:
+    image: minio/mc:latest
+    depends_on:
+      minio:
+        condition: service_healthy
+    entrypoint: >
+      /bin/sh -c "
+      mc alias set local http://minio:9000 minioadmin minioadmin;
+      mc mb --ignore-existing local/chunk-verify;
+      exit 0;
+      "
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
       interval: 5s
       timeout: 3s
       retries: 20
 
+  api-a:
+    build: ./server
+    environment:
+      PORT: 3000
+      DB_HOST: mysql
+      DB_PORT: 3306
+      DB_USER: root
+      DB_PASSWORD: root
+      DB_NAME: chunk_verify
+      OBJECT_STORE: s3
+      S3_ENDPOINT: http://minio:9000
+      S3_BUCKET: chunk-verify
+      S3_ACCESS_KEY: minioadmin
+      S3_SECRET_KEY: minioadmin
+      S3_FORCE_PATH_STYLE: "1"
+      LOCK_DRIVER: redis
+      REDIS_URL: redis://redis:6379
+    ports:
+      - "3001:3000"
+    depends_on:
+      mysql:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+      minio-init:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+
+  api-b:
+    build: ./server
+    environment:
+      PORT: 3000
+      DB_HOST: mysql
+      DB_PORT: 3306
+      DB_USER: root
+      DB_PASSWORD: root
+      DB_NAME: chunk_verify
+      OBJECT_STORE: s3
+      S3_ENDPOINT: http://minio:9000
+      S3_BUCKET: chunk-verify
+      S3_ACCESS_KEY: minioadmin
+      S3_SECRET_KEY: minioadmin
+      S3_FORCE_PATH_STYLE: "1"
+      LOCK_DRIVER: redis
+      REDIS_URL: redis://redis:6379
+    ports:
+      - "3002:3000"
+    depends_on:
+      mysql:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+      minio-init:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+
 volumes:
   mysql-data:
+  minio-data:

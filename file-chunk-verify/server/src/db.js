@@ -36,6 +36,8 @@ async function ensureSchema(pool) {
       merged_hash        CHAR(64)     NULL,
       status             ENUM('uploading','merging','completed','failed') NOT NULL DEFAULT 'uploading',
       merged_path        VARCHAR(1024) NULL,
+      merge_owner        VARCHAR(128) NULL COMMENT '当前执行合并的实例标识（崩溃恢复用）',
+      merge_lease_until  DATETIME(3)  NULL COMMENT '合并租约到期时间；过期后其它实例可接管',
       created_at         DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
       updated_at         DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3),
       PRIMARY KEY (id),
@@ -90,6 +92,21 @@ async function ensureSchema(pool) {
   // 迭代二起 file_hash 允许为 NULL（分阶段任务：init 时无聚合哈希，/hash 后补报）。
   // 旧 schema 为 NOT NULL，真 MySQL 下分阶段 init 会直接 ER_BAD_NULL_ERROR(500)。
   await migrateNullableColumn(pool, 'files', 'file_hash', 'CHAR(64) NULL');
+  // 合并租约列（崩溃后其它实例可接管卡死的 merging）。旧库没有则 ADD COLUMN。
+  await ensureColumn(pool, 'files', 'merge_owner', 'VARCHAR(128) NULL');
+  await ensureColumn(pool, 'files', 'merge_lease_until', 'DATETIME(3) NULL');
+}
+
+/** 幂等新增列：列不存在时 ADD COLUMN */
+async function ensureColumn(pool, table, column, ddl) {
+  const [cols] = await pool.query(
+    `SELECT 1 FROM information_schema.COLUMNS
+      WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ? AND COLUMN_NAME = ?`,
+    [config.db.database, table, column],
+  );
+  if (cols.length === 0) {
+    await pool.query(`ALTER TABLE \`${table}\` ADD COLUMN \`${column}\` ${ddl}`);
+  }
 }
 
 /**

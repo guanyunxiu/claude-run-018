@@ -11,11 +11,14 @@
     "test:e2e": "node --no-warnings --loader ./test/mock-mysql-loader.mjs test/e2e.mjs",
     "test:migrate": "node --no-warnings --loader ./test/mock-mysql-loader.mjs test/migrate-nullable.mjs",
     "smoke:staged": "node --no-warnings --loader ./test/mock-mysql-loader.mjs test/smoke-staged.mjs",
-    "smoke:cas": "node --no-warnings --loader ./test/mock-mysql-loader.mjs test/smoke-cas.mjs"
+    "smoke:cas": "node --no-warnings --loader ./test/mock-mysql-loader.mjs test/smoke-cas.mjs",
+    "test:multi": "node --no-warnings --loader ./test/mock-mysql-loader.mjs test/multi-instance.mjs"
   },
   "dependencies": {
+    "@aws-sdk/client-s3": "^3.1133.0",
     "cors": "^2.8.5",
     "express": "^4.21.2",
+    "ioredis": "^6.0.0",
     "mysql2": "^3.11.5"
   },
   "engines": {

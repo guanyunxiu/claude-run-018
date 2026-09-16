@@ -19,7 +19,6 @@ function loadDotEnv() {
     if (eq === -1) continue;
     const key = line.slice(0, eq).trim();
     let value = line.slice(eq + 1).trim();
-    // 去掉成对引号
     if (
       (value.startsWith('"') && value.endsWith('"')) ||
       (value.startsWith("'") && value.endsWith("'"))
@@ -51,4 +50,22 @@ export const config = {
     : path.join(serverRoot, process.env.STORAGE_DIR || 'storage'),
   chunkLimitBytes: int(process.env.CHUNK_LIMIT_BYTES, 64 * 1024 * 1024),
   serverRoot,
+
+  /* ---- 物理存储后端：s3(MinIO/Amazon S3) | local（仅单测/单机） ---- */
+  objectStore: (process.env.OBJECT_STORE || 'local').toLowerCase(), // s3 | local
+  s3: {
+    endpoint: process.env.S3_ENDPOINT || 'http://127.0.0.1:9000',
+    region: process.env.S3_REGION || 'us-east-1',
+    bucket: process.env.S3_BUCKET || 'chunk-verify',
+    accessKeyId: process.env.S3_ACCESS_KEY || 'minioadmin',
+    secretAccessKey: process.env.S3_SECRET_KEY || 'minioadmin',
+    forcePathStyle: process.env.S3_FORCE_PATH_STYLE !== '0', // MinIO 必须 true
+  },
+
+  /* ---- 跨机器协调：redis（默认） | memory（测试：进程内共享） | none ---- */
+  lock: {
+    driver: (process.env.LOCK_DRIVER || 'memory').toLowerCase(),
+    redisUrl: process.env.REDIS_URL || 'redis://127.0.0.1:6379',
+    ttlMs: int(process.env.LOCK_TTL_MS, 60_000),
+  },
 };

@@ -2,15 +2,73 @@
 
 前端（TypeScript + 单 WebWorker + Web Crypto + Fetch + IndexedDB）把 GB 级本地文件固定大小分片，
 在 Worker 中计算每片 SHA-256，采用**有界「哈希 → 上传」流水线**边算边传；分片哈希持久化到
-IndexedDB 支持刷新后续算。后端（Node.js + Express + MySQL + 本地磁盘）为**内容寻址（CAS）**：
-物理分片按 `chunkHash` 全局去重存放、引用计数管理生命周期；**相同文件秒传**（零上传直接完成）、
-**不同文件共享相同内容分片物理只存一份**；`complete` 时从磁盘重算全部哈希做强校验后流式合并，
-合并产物同样内容寻址并可被秒传复用。
+IndexedDB 支持刷新后续算。后端（Node.js + Express + MySQL）为**内容寻址（CAS）**，物理存放处
+抽象为 **ObjectStore**：默认 **MinIO/S3 对象存储**（多台后端共享一套），可切本机磁盘（单测）；
+跨机器用 **Redis 锁**协调。物理分片按 `chunkHash` 全局去重、引用计数管理生命周期；**相同文件
+秒传**、**不同文件共享相同内容分片只存一份**；`complete` 时从对象存储重读全部哈希做强校验后
+**服务端拼接合并**，合并产物同样内容寻址并可被秒传复用。多台后端一起传、一起合并、一起清理
+都不会乱，进程中途被杀也能重跑到一致。
 
 > 说明：需求描述中 “Node.js，Web 框架（Gin/SpringBoot）” 存在冲突，Gin 为 Go 框架、
 > Spring Boot 为 Java 框架。本实现按 Node.js 生态选择 **Express**。
 
-## 迭代三：内容寻址（CAS）· 秒传 · 跨文件去重 · 引用计数 GC（当前版本）
+## 迭代四：对象存储（MinIO/S3）+ Redis 跨机器协调（当前版本）
+
+### 架构
+
+```
+浏览器 ──► api-a(:3001) ┐
+        └► api-b(:3002) ┼──► MySQL（元数据/引用计数/合并租约）
+                          ├──► MinIO/S3（唯一物理存放处，内容寻址 key）
+                          └──► Redis（跨机器锁：cas:<hash> / merge:<fileId> / gc）
+```
+
+- **ObjectStore 抽象**（`server/src/store/`）：`putIfAbsent / getBuffer / getStream /
+  stat / delete / listPrefixMeta / compose / copy`。
+  - `S3ObjectStore`：MinIO/Amazon S3；`putIfAbsent` 用条件写 `IfNoneMatch:'*'`，
+    合并用 **MultipartUpload 服务端拼接**（大分片 `UploadPartCopy`、小分片 `UploadPart`），
+    半成品只存在于 `tmp/`，再 copy-if-absent 到内容寻址 key。
+  - `LocalObjectStore`：本机磁盘，仅单测/单机；多实例测试里两 app 指向同一目录即等价共享存储。
+  - 对象 key 仍按内容哈希拼，**绝不使用 fileId**：`cas/<xx>/<hash>.part`、
+    `merged/<xx>/<hash>.bin`、`tmp/<uuid>.tmp`。
+- **跨机器锁**（`server/src/store/locker.js`）：`redis`（`SET NX PX` + token 校验释放 + 续租）
+  或 `memory`（测试：多 app 共享一把）。
+
+### 并发正确性
+
+| 场景 | 保证 |
+| --- | --- |
+| 双机同哈希首传 | 分布式锁 `cas:<hash>` 串行 + 对象条件写只保留一份 + `INSERT IGNORE` 建行后统一 `ref_count+1`，cas_chunks 仅一行、计数精确 |
+| 双机同时 complete | Redis `merge:<fileId>` 只放一个进入；DB 条件更新 + **合并租约**（`merge_owner/merge_lease_until`）保证唯一；输的一方 409 |
+| 合并到一半崩溃 | 半成品只在 `tmp/`，内容寻址目标要么不存在要么完整；租约过期后另一台可接管重试；校验失败回退 `uploading` |
+| 多机 GC | 全集群 `gc` 锁只跑一个；**先删库行（事务提交）后删对象**，删前再查无引用（防首传对撞），再磁盘对账删孤儿；中途被杀重跑幂等 |
+| 库有行对象无 | 上传命中时验盘，缺失用请求体重写（`healed:true`）；`/link` 无字节则报 `CHUNK_FILE_MISSING`，前端回退字节上传 |
+
+### docker-compose（2 后端 + MySQL + MinIO + Redis）
+
+```bash
+docker compose up -d --build
+# api-a: http://localhost:3001   api-b: http://localhost:3002
+# MinIO Console: http://localhost:9001 (minioadmin/minioadmin)
+# 前端开发服务器代理可指向任意一台（web/vite.config.ts 已代理 /api → :3000）
+```
+
+复现并发问题（两台一起打）：
+
+```bash
+# 双机同哈希首传、双机同时 complete、A 传一半换 B、GC 对撞、删 A 不影响 B：
+cd server && npm run test:multi     # 21 项断言（两个 app 端口 + 共享存储/锁）
+```
+
+### 对象存储/锁配置（环境变量）
+
+`OBJECT_STORE=s3|local`（默认 local，单测用；生产/dockerkit 用 s3）、`S3_ENDPOINT/S3_BUCKET/
+S3_ACCESS_KEY/S3_SECRET_KEY/S3_FORCE_PATH_STYLE`、`LOCK_DRIVER=redis|memory|none`、
+`REDIS_URL`、`LOCK_TTL_MS`。详见 `server/.env.example`。
+
+---
+
+## 迭代三：内容寻址（CAS）· 秒传 · 跨文件去重 · 引用计数 GC
 
 ### 核心能力
 
@@ -138,14 +196,14 @@ merged_blobs     合并产物：merged_hash(PK), file_size, storage_path, ref_co
 
 ```bash
 cd server
+npm run test:multi     # ★ 21 项多机一致性：两台 app（不同端口）共享对象存储+锁，
+                       #   双机同哈希首传(一行/ref=2/一份对象)、双机同时 complete(唯一成功)、
+                       #   A 传一半换 B 续传完成、GC 与首传对撞、删 A 不影响 B、归零后对象真删
 npm run test:e2e       # 115 条：秒传、跨文件去重、删 A 不影响 B、引用归零 GC、
                        #   并发同 hash 首传幂等、篡改共享分片检出、
                        #   hits 命中片必须 /link 否则 CHUNKS_INCOMPLETE、
-                       #   先传若干片再秒传的引用精确性、
-                       #   GC 幽灵片（有行无文件）字节上传自愈 + GC 幂等、
-                       #   多捐赠者中跳过关联不完整的最新候选选中完好者
-npm run test:migrate   # 旧库 file_hash NOT NULL → 启动迁移变 NULLABLE（恰好一次 ALTER、
-                       #   幂等、历史数据保留），迁移后分阶段 init(fileHash=null) 主路径可用
+                       #   先传若干片再秒传的引用精确性、GC 幽灵片自愈、多捐赠者选择
+npm run test:migrate   # 旧库 file_hash NOT NULL → 启动迁移变 NULLABLE（恰好一次 ALTER、幂等）
 npm run smoke:staged   # 分阶段边传边补哈希 + 强校验（40MB）
 npm run smoke:cas      # 25 项真实 HTTP：A 正常→B 秒传零上传→C 用 link 只关联命中片+传差异片
                        #   →无视 hits 裸跳过被 CHUNKS_INCOMPLETE 拦截→删除→GC 物理回收
@@ -156,6 +214,10 @@ npm run test:pipeline  # 69 条：边算边传、有界槽位、续算续传、�
                        #   link 发现幽灵片回退字节上传自愈、本任务关联优先
 npm run smoke:resume   # 4GB/512 片中途刷新的复用与有界内存
 ```
+
+> 默认 `OBJECT_STORE=local`、`LOCK_DRIVER=memory`，上述测试无需 Docker/MySQL 即可跑
+> （内存 mock DB + 本机磁盘对象存储 + 进程内锁）。要对真 MinIO/Redis 验证，
+> `docker compose up -d --build` 后把 `OBJECT_STORE=s3 LOCK_DRIVER=redis` 指向对应端口即可。
 
 ---
 
@@ -248,28 +310,36 @@ npm run smoke:resume   # 4GB/512 片中途刷新的复用与有界内存
 
 ```
 file-chunk-verify/
-├── docker-compose.yml          # 本地 MySQL 8
+├── docker-compose.yml          # 2 后端 + MySQL + MinIO(S3) + Redis + bucket 初始化
 ├── README.md
-├── server/                     # 后端：Express + MySQL + CAS 磁盘存储
+├── server/
+│   ├── Dockerfile .dockerignore
 │   ├── sql/schema.sql          # files / cas_chunks / file_chunks / merged_blobs
 │   ├── src/
-│   │   ├── config.js  db.js  hash.js  storage.js   # storage 为 CAS 内容寻址
+│   │   ├── config.js  db.js  hash.js  storage.js  # storage.js 是对象存储外观
 │   │   ├── app.js  server.js
+│   │   ├── store/              # ★ ObjectStore + 分布式锁
+│   │   │   ├── base.js         #   接口约定 + casKey/mergedKey（按内容哈希）
+│   │   │   ├── local.js        #   本机磁盘实现（单测）
+│   │   │   ├── s3.js           #   MinIO/S3：条件写 + multipart 服务端合并
+│   │   │   ├── index.js        #   工厂（OBJECT_STORE）
+│   │   │   └── locker.js       #   Redis 锁 / memory 锁
+│   │   ├── services/cas.js     # ensureCasChunk：锁+条件写+唯一键，自愈幽灵片
 │   │   └── routes/
-│   │       ├── files.js        # init/precheck/hash/chunks/complete/delete/download
-│   │       └── admin.js        # POST /api/admin/gc 孤儿对象回收
-│   └── test/                   # 79 条端到端断言 + 2 个真实 HTTP 冒烟
+│   │       ├── files.js        # init/precheck/hash/chunks/link/complete/delete/download
+│   │       └── admin.js        # POST /api/admin/gc 跨机安全垃圾回收
+│   └── test/                   # multi(21)+e2e(115)+migrate+2 个 HTTP 冒烟
 └── web/                        # 前端：Vite + TypeScript
     ├── index.html
     └── src/
         ├── main.ts             # 页面 UI（哈希/上传/流水线三段状态，秒传提示）
-        ├── uploader.ts         # 依赖装配：清单秒传/边算边传/算完仲裁/去重跳过
-        ├── pipeline.ts         # ★ 有界流水线（含全局 CAS skip 集合与秒传仲裁钩子）
+        ├── uploader.ts         # 依赖装配：清单秒传/边算边传/算完仲裁/去重 link
+        ├── pipeline.ts         # ★ 有界流水线（全局 CAS link + 秒传仲裁 + 自愈回退）
         ├── idb-cache.ts        # IndexedDB 哈希缓存（指纹/连续游标）
         ├── hash.worker.ts      # 唯一 WebWorker：SHA-256
         ├── api.ts  types.ts  style.css
     └── test/
-        ├── pipeline.test.mjs   # 52 条流水线断言（边算边传/有界/续算/取消/去重/秒传中止）
+        ├── pipeline.test.mjs   # 69 条流水线断言
         ├── smoke-resume.mjs    # 4GB 大样例中途刷新复用冒烟
         └── import-ts.mjs       # esbuild 内存转译 TS 供 Node 测试
 ```
