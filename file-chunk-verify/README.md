@@ -38,11 +38,13 @@ IndexedDB 支持刷新后续算。后端（Node.js + Express + MySQL）为**内�
 
 | 场景 | 保证 |
 | --- | --- |
+| 秒传/precheck 判定捐赠者 | 合并产物与每个分片的可读性**全部走 ObjectStore.stat**（S3/MinIO 或本地），不读本机磁盘；S3 模式下也能正确秒传 |
+| S3 合并 | ≥5MB 分片走 `UploadPartCopy`（服务端拷贝），更小分片按序累积成 ≥5MB 的 part（最后一片可小），满足 multipart 限制；`UploadPartCopyCommand` 已正确导入 |
 | 双机同哈希首传 | 分布式锁 `cas:<hash>` 串行 + 对象条件写只保留一份 + `INSERT IGNORE` 建行后统一 `ref_count+1`，cas_chunks 仅一行、计数精确 |
 | 双机同时 complete | Redis `merge:<fileId>` 只放一个进入；DB 条件更新 + **合并租约**（`merge_owner/merge_lease_until`）保证唯一；输的一方 409 |
-| 合并到一半崩溃 | 半成品只在 `tmp/`，内容寻址目标要么不存在要么完整；租约过期后另一台可接管重试；校验失败回退 `uploading` |
-| 多机 GC | 全集群 `gc` 锁只跑一个；**先删库行（事务提交）后删对象**，删前再查无引用（防首传对撞），再磁盘对账删孤儿；中途被杀重跑幂等 |
-| 库有行对象无 | 上传命中时验盘，缺失用请求体重写（`healed:true`）；`/link` 无字节则报 `CHUNK_FILE_MISSING`，前端回退字节上传 |
+| 合并到一半崩溃/异常 | 半成品只在 `tmp/`，内容寻址目标要么不存在要么完整；**异常回退 `uploading` 并清租约（不置终态 failed）**，租约过期后可重试并自愈收敛 |
+| 多机 GC | 全集群 `gc` 锁只跑一个；**先删库行（事务提交）后删对象**，删前再查无引用（防首传对撞），再对象对账删孤儿；中途被杀重跑幂等 |
+| 库有行对象无 | 上传命中时走 ObjectStore 验盘，缺失用请求体重写（`healed:true`）；`/link` 无字节则报 `CHUNK_FILE_MISSING`，前端回退字节上传 |
 
 ### docker-compose（2 后端 + MySQL + MinIO + Redis）
 
@@ -207,6 +209,9 @@ npm run test:migrate   # 旧库 file_hash NOT NULL → 启动迁移变 NULLABLE�
 npm run smoke:staged   # 分阶段边传边补哈希 + 强校验（40MB）
 npm run smoke:cas      # 25 项真实 HTTP：A 正常→B 秒传零上传→C 用 link 只关联命中片+传差异片
                        #   →无视 hits 裸跳过被 CHUNKS_INCOMPLETE 拦截→删除→GC 物理回收
+npm run smoke:s3       # ★ 29 项真实 @aws-sdk/client-s3 走进程内 S3 兼容桩（等价 MinIO 语义）：
+                       #   ≥5MB 分片 UploadPartCopy 完成+下载、小分片 carry 累积、
+                       #   捐赠者对象存储可读故秒传/precheck 命中、合并失败回退 uploading 自愈重试
 
 cd ../web
 npm run test:pipeline  # 69 条：边算边传、有界槽位、续算续传、全局命中走 link（非裸跳过）、

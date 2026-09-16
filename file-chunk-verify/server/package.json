@@ -12,7 +12,8 @@
     "test:migrate": "node --no-warnings --loader ./test/mock-mysql-loader.mjs test/migrate-nullable.mjs",
     "smoke:staged": "node --no-warnings --loader ./test/mock-mysql-loader.mjs test/smoke-staged.mjs",
     "smoke:cas": "node --no-warnings --loader ./test/mock-mysql-loader.mjs test/smoke-cas.mjs",
-    "test:multi": "node --no-warnings --loader ./test/mock-mysql-loader.mjs test/multi-instance.mjs"
+    "test:multi": "node --no-warnings --loader ./test/mock-mysql-loader.mjs test/multi-instance.mjs",
+    "smoke:s3": "node --no-warnings --loader ./test/mock-mysql-loader.mjs test/s3-smoke.mjs"
   },
   "dependencies": {
     "@aws-sdk/client-s3": "^3.1133.0",

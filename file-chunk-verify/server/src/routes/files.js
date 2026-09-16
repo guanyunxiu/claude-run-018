@@ -29,6 +29,7 @@ import {
   casChunkPhysicalOk,
   mergeCasChunks,
   mergedBlobExists,
+  mergedBlobPhysicalOk,
   createMergedReadStream,
   mergedBlobAbs,
   safeFileId,
@@ -131,24 +132,19 @@ async function findUsableDonor(conn, fileHash, expectedChunkHashes) {
   return null;
 }
 
-/** 校验单个候选捐赠者：合并产物可读 + 分片关联齐全 + 逐片哈希一致 + 物理可读 */
+/** 校验单个候选捐赠者：合并产物可读 + 分片关联齐全 + 逐片哈希一致 + 对象存储可读 */
 async function isDonorUsable(conn, donor, expectedChunkHashes) {
-  // 合并产物元数据与物理文件都在
+  // 合并产物元数据在库，且对象存储上真实存在、大小一致（不能只看本机磁盘）
   const [mb] = await conn.query(
-    'SELECT merged_hash, storage_path FROM merged_blobs WHERE merged_hash = ? FOR UPDATE',
+    'SELECT merged_hash FROM merged_blobs WHERE merged_hash = ? FOR UPDATE',
     [donor.merged_hash],
   );
   if (mb.length === 0) return false;
-  try {
-    const st = await fsp.stat(path.join(config.storageDir, mb[0].storage_path));
-    if (BigInt(st.size) !== BigInt(donor.file_size)) return false;
-  } catch {
-    return false;
-  }
+  if (!(await mergedBlobPhysicalOk(donor.merged_hash, donor.file_size))) return false;
 
-  // 分片关联齐全且物理可读；若给了清单则逐片哈希必须一致
+  // 分片关联齐全且对象存储可读；若给了清单则逐片哈希必须一致
   const [links] = await conn.query(
-    `SELECT fc.chunk_index, fc.chunk_hash, cc.chunk_size, cc.storage_path
+    `SELECT fc.chunk_index, fc.chunk_hash, cc.chunk_size
        FROM file_chunks fc
        JOIN cas_chunks cc ON cc.chunk_hash = fc.chunk_hash
       WHERE fc.file_id = ?
@@ -160,12 +156,10 @@ async function isDonorUsable(conn, donor, expectedChunkHashes) {
     const link = links[i];
     if (link.chunk_index !== i) return false;
     if (expectedChunkHashes && expectedChunkHashes[i] !== link.chunk_hash) return false;
-    // 逐片物理可读（秒传也要防止元数据指向空文件/损坏文件）
-    try {
-      const st = await fsp.stat(path.join(config.storageDir, link.storage_path));
-      if (BigInt(st.size) !== BigInt(link.chunk_size)) return false;
-      if (st.size === 0 && donor.file_size !== '0') return false;
-    } catch {
+    // 逐片在对象存储上可读、大小匹配（S3/MinIO 或本地，统一走 ObjectStore）
+    const ok = await casChunkPhysicalOk(link.chunk_hash, link.chunk_size);
+    if (!ok) {
+      if (link.chunk_size === 0 && donor.file_size === '0') continue;
       return false;
     }
   }
@@ -1030,9 +1024,17 @@ router.post(
         mergedPath: merged.relPath,
       });
     } catch (err) {
-      if (!err.status) {
+      // 合并/对象存储异常必须可恢复：回退为 uploading 并清空租约，
+      // 客户端/另一台实例可再次抢占 complete 重试（幂等，半成品只在 tmp/）。
+      // 不再置终态 failed（旧逻辑会让任务永久卡死、租约接管也进不去）。
+      if (!err.status || err.status >= 500) {
         await pool
-          .query("UPDATE files SET status = 'failed' WHERE id = ?", [fileId])
+          .query(
+            `UPDATE files
+                SET status='uploading', merge_owner=NULL, merge_lease_until=NULL
+              WHERE id=? AND status='merging'`,
+            [fileId],
+          )
           .catch(() => {});
       }
       throw err;

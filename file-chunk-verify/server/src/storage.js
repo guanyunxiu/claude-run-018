@@ -78,6 +78,18 @@ export async function mergedBlobExists(mergedHash) {
   return st.exists;
 }
 
+/** 合并产物存在且大小匹配（秒传捐赠者校验/下载前校验，走对象存储而非本机磁盘） */
+export async function mergedBlobPhysicalOk(mergedHash, expectedSize) {
+  try {
+    const st = await objectStore().stat(mergedKey(safeHash(mergedHash)));
+    if (!st.exists) return false;
+    if (expectedSize !== undefined && BigInt(st.size) !== BigInt(expectedSize)) return false;
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 /**
  * 按序读取 CAS 分片，在对象存储侧拼接合并，并计算完整文件 sha256，
  * 最后“条件安装”到内容寻址 key：

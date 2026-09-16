@@ -19,6 +19,7 @@ import {
   ListObjectsV2Command,
   CreateMultipartUploadCommand,
   UploadPartCommand,
+  UploadPartCopyCommand,
   CompleteMultipartUploadCommand,
   AbortMultipartUploadCommand,
   CopyObjectCommand,
@@ -174,10 +175,14 @@ class S3ObjectStore {
   }
 
   /**
-   * 服务端拼接：multipart 直接组装到 destKey（调用方传入 tmp/ 临时 key）。
-   * 半成品只存在于 tmp/；组装成功后调用方再 copy-if-absent 到内容寻址 key。
+   * 服务端拼接（不把整个合并结果拉到本机内存再回传）：
+   *  - 每个 >=5MB 的源对象作为一个 part，直接 UploadPartCopy（S3 侧拷贝）。
+   *  - 小于 5MB 的源对象按序读取并累积到 part 缓冲，凑满 PART_MIN 即 UploadPart，
+   *    保证除最后一个 part 外每个 part 都 >=5MB（S3 multipart 硬限制）。
+   * 半成品只存在于调用方指定的 tmp/ key；失败 Abort，绝不污染内容寻址目标。
    */
   async compose(sources, destKey) {
+    const PART_MIN = 5 * 1024 * 1024;
     const multipart = await this.client.send(
       new CreateMultipartUploadCommand({
         Bucket: this.bucket,
@@ -187,36 +192,84 @@ class S3ObjectStore {
     );
     const uploadId = multipart.UploadId;
     const parts = [];
+    let partNo = 0;
+    let carry = Buffer.alloc(0); // 累积的小分片字节
+
+    const flushBuffer = async (isLast) => {
+      if (carry.length === 0) return;
+      // 非最后 part 必须 >=5MB；若仍不足（总文件就很小），作为唯一 part 也合法
+      if (!isLast && carry.length < PART_MIN) return; // 等后续源继续累积
+      partNo += 1;
+      const r = await this.client.send(
+        new UploadPartCommand({
+          Bucket: this.bucket,
+          Key: destKey,
+          UploadId: uploadId,
+          PartNumber: partNo,
+          Body: carry,
+        }),
+      );
+      parts.push({ PartNumber: partNo, ETag: r.ETag });
+      carry = Buffer.alloc(0);
+    };
+
     try {
       for (let i = 0; i < sources.length; i += 1) {
-        const srcSize = (await this.stat(sources[i])).size;
-        let etag;
-        if (srcSize >= 5 * 1024 * 1024) {
+        const srcKey = sources[i];
+        const srcSize = (await this.stat(srcKey)).size;
+
+        if (srcSize >= PART_MIN && carry.length === 0) {
+          // 大源且没有挂起的小字节：服务端直接拷贝整对象为一个 part
+          partNo += 1;
           const r = await this.client.send(
             new UploadPartCopyCommand({
               Bucket: this.bucket,
               Key: destKey,
               UploadId: uploadId,
-              PartNumber: i + 1,
-              CopySource: sources[i].split('/').map(encodeURIComponent).join('/').replace(/^/, `/${this.bucket}/`),
+              PartNumber: partNo,
+              // CopySource = /bucket/key；key 为 cas/<xx>/<hash>.part，无特殊字符
+              CopySource: `/${this.bucket}/${srcKey}`,
             }),
           );
-          etag = r.CopyPartResult.ETag;
+          parts.push({ PartNumber: partNo, ETag: r.CopyPartResult.ETag });
         } else {
-          const buf = await this.getBuffer(sources[i]);
-          const r = await this.client.send(
-            new UploadPartCommand({
-              Bucket: this.bucket,
-              Key: destKey,
-              UploadId: uploadId,
-              PartNumber: i + 1,
-              Body: buf,
-            }),
-          );
-          etag = r.ETag;
+          // 小源，或前面已有累积字节：读字节追加（保持顺序），凑满即冲刷
+          const buf = await this.getBuffer(srcKey);
+          carry = carry.length === 0 ? buf : Buffer.concat([carry, buf]);
+          if (carry.length >= PART_MIN) {
+            partNo += 1;
+            const r = await this.client.send(
+              new UploadPartCommand({
+                Bucket: this.bucket,
+                Key: destKey,
+                UploadId: uploadId,
+                PartNumber: partNo,
+                Body: carry,
+              }),
+            );
+            parts.push({ PartNumber: partNo, ETag: r.ETag });
+            carry = Buffer.alloc(0);
+          }
         }
-        parts.push({ PartNumber: i + 1, ETag: etag });
       }
+
+      // 冲刷剩余字节（最后一个 part 允许 <5MB）
+      await flushBuffer(true);
+      // 极端情况：所有源都是 0 字节，也要完成一个空对象
+      if (parts.length === 0) {
+        partNo += 1;
+        const r = await this.client.send(
+          new UploadPartCommand({
+            Bucket: this.bucket,
+            Key: destKey,
+            UploadId: uploadId,
+            PartNumber: partNo,
+            Body: Buffer.alloc(0),
+          }),
+        );
+        parts.push({ PartNumber: partNo, ETag: r.ETag });
+      }
+
       await this.client.send(
         new CompleteMultipartUploadCommand({
           Bucket: this.bucket,
