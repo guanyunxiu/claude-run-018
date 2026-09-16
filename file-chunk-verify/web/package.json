@@ -6,12 +6,15 @@
   "scripts": {
     "dev": "vite",
     "build": "tsc -p tsconfig.json --noEmit && tsc -p tsconfig.worker.json --noEmit && vite build",
+    "test:pipeline": "node test/pipeline.test.mjs",
+    "smoke:resume": "node test/smoke-resume.mjs",
     "preview": "vite preview"
   },
   "dependencies": {
     "vite": "^5.4.11"
   },
   "devDependencies": {
+    "esbuild": "^0.28.2",
     "typescript": "^5.7.2"
   }
 }

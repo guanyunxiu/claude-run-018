@@ -18,11 +18,15 @@ const hashBar = $('hashBar');
 const upBar = $('upBar');
 const hashText = $('hashText');
 const upText = $('upText');
+const pipelineText = $('pipelineText');
+const hashStage = $('hashStage');
+const upStage = $('upStage');
 const logBox = $('log');
 const resultBox = $('result');
 
 const rFileId = $('rFileId');
 const rChunks = $('rChunks');
+const rUp = $('rUp');
 const rAgg = $('rAgg');
 const rMerged = $('rMerged');
 const rPath = $('rPath');
@@ -53,6 +57,9 @@ function resetUI(): void {
   upBar.style.width = '0%';
   hashText.textContent = '哈希进度：-';
   upText.textContent = '上传进度：-';
+  pipelineText.textContent = '流水线：-';
+  hashStage.textContent = '';
+  upStage.textContent = '';
   resultBox.classList.add('hidden');
 }
 
@@ -83,36 +90,56 @@ chunkSizeSelect.addEventListener('change', () => {
 
 function renderProgress(p: UploadProgress): void {
   hashBar.style.width = `${pct(p.hashedBytes, p.totalBytes)}%`;
+  // 上传进度含“服务端已有跳过”部分（settledBytes 在启动时为 0，跳过通过事件累加）
   upBar.style.width = `${pct(p.settledBytes, p.totalBytes)}%`;
 
   hashText.textContent =
     `哈希进度：${p.hashedChunks}/${p.totalChunks} 片` +
-    `（${formatBytes(p.hashedBytes)} / ${formatBytes(p.totalBytes)}）`;
+    `（${formatBytes(p.hashedBytes)} / ${formatBytes(p.totalBytes)}）` +
+    (p.hashCacheReused > 0 ? ` · IndexedDB 复用 ${p.hashCacheReused} 片` : '');
 
   const phaseName: Record<UploadProgress['phase'], string> = {
-    hashing: '哈希计算中',
     init: '注册/恢复任务',
-    uploading: '上传中',
+    'instant-done': '⚡ 秒传命中',
+    pipeline: '边算边传',
+    'locking-hash': '补报聚合哈希',
     completing: '服务端聚合校验中',
     done: '完成',
   };
+
   upText.textContent =
     `上传进度：${p.settledChunks}/${p.totalChunks} 片` +
     `（${formatBytes(p.settledBytes)} / ${formatBytes(p.totalBytes)}）` +
-    ` · 状态：${phaseName[p.phase]}` +
-    (p.phase === 'uploading' && p.newlyUploadedBytes > 0
-      ? ` · 本次新传 ${formatBytes(p.newlyUploadedBytes)} @ ${formatBytes(
+    ` · ${phaseName[p.phase]}` +
+    (p.phase === 'pipeline' && p.newlyUploadedBytes > 0
+      ? ` · 新传 ${formatBytes(p.newlyUploadedBytes)} @ ${formatBytes(
           Math.round(p.bytesPerSec),
         )}/s`
       : '');
+
+  pipelineText.textContent =
+    `流水线：哈希中 ${p.hashing ? '🟢' : '⚪'} ｜ 排队 ${p.queuedChunks} 片` +
+    ` ｜ 上传中 ${p.uploading ? '🟢' : '⚪'} ｜ 在途槽位 ${p.inflightChunks}` +
+    ` ｜ 本任务跳过 ${p.serverSkippedChunks} 片 ｜ 全局去重 ${p.globalDedupChunks} 片`;
+
+  hashStage.textContent = p.hashing ? 'WORKING' : p.hashedChunks > 0 ? 'IDLE' : '';
+  upStage.textContent = p.uploading ? 'UPLOADING' : p.settledChunks > 0 ? 'IDLE' : '';
 }
 
 function showResult(result: UploadResult): void {
-  rFileId.textContent = result.complete.fileId;
-  rChunks.textContent = `${result.complete.totalChunks} 片（断点跳过 ${result.skippedChunks} 片）`;
-  rAgg.textContent = result.complete.aggregateHash;
-  rMerged.textContent = result.complete.mergedHash;
-  rPath.textContent = result.complete.mergedPath;
+  const f = result.init.file;
+  rFileId.textContent = f.fileId;
+  rChunks.textContent =
+    `${f.totalChunks} 片（IndexedDB 复用哈希 ${result.hashCacheReused} 片` +
+    (result.instant ? ' · ⚡ 秒传' : '') +
+    '）';
+  rUp.textContent = result.instant
+    ? `⚡ 秒传：新传 0 片 / 复用服务端 ${f.totalChunks} 片（全局去重 ${result.globalDedupChunks} 片）`
+    : `新传 ${result.newlyUploadedChunks} 片 / 本任务跳过 ${result.serverSkippedChunks} 片 / 全局 CAS 去重 ${result.globalDedupChunks} 片`;
+  // 秒传时没有本次 complete 响应，用 init 中已锁定的文件/合并哈希展示
+  rAgg.textContent = result.complete?.aggregateHash ?? f.fileHash ?? '(复用已有)';
+  rMerged.textContent = result.complete?.mergedHash ?? f.mergedHash ?? '(复用已有)';
+  rPath.textContent = result.complete?.mergedPath ?? f.mergedPath ?? '(复用已有)';
   resultBox.classList.remove('hidden');
 }
 
@@ -134,7 +161,8 @@ startBtn.addEventListener('click', async () => {
     const result = await uploadFileInChunks({
       file: currentFile,
       chunkSize,
-      concurrency: 3,
+      maxInflight: 6,
+      uploadConcurrency: 3,
       signal: abortController.signal,
       onLog: log,
       onProgress: renderProgress,
@@ -142,7 +170,7 @@ startBtn.addEventListener('click', async () => {
     showResult(result);
   } catch (err) {
     if (err instanceof DOMException && err.name === 'AbortError') {
-      log('已取消。已上传的分片保留在服务端，再次开始将自动跳过。');
+      log('已取消。本地哈希缓存与服务端已传分片均保留，再次开始将自动续算、续传。');
     } else if (err instanceof ApiException) {
       log(`接口错误 [${err.code}] HTTP ${err.status}：${err.message}`);
       if (err.details) log(`详情：${JSON.stringify(err.details)}`);

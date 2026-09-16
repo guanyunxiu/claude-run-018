@@ -30,6 +30,7 @@ await new Promise((resolve) => {
 });
 const port = server.address().port;
 const base = `http://localhost:${port}/api/files`;
+const adminBase = `http://localhost:${port}/api/admin`;
 
 async function call(method, urlPath, body, headers = {}) {
   const res = await fetch(`${base}${urlPath}`, {
@@ -45,6 +46,16 @@ async function call(method, urlPath, body, headers = {}) {
     json = text;
   }
   return { status: res.status, json };
+}
+
+/** 调用孤儿对象 GC（独立挂载于 /api/admin/gc） */
+async function gcCall(minAgeSec = 0) {
+  const res = await fetch(`${adminBase}/gc`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ minAgeSec }),
+  });
+  return { status: res.status, json: await res.json() };
 }
 
 let passed = 0;
@@ -274,9 +285,9 @@ console.log('场景 4：落盘分片在磁盘上被篡改，complete 重算哈�
   await call('POST', `/${fileId}/chunks/0?hash=${hashes[0]}`, content.subarray(0, 8));
   await call('POST', `/${fileId}/chunks/1?hash=${hashes[1]}`, content.subarray(8));
 
-  // 直接篡改磁盘上的 0 号分片
+  // 直接篡改磁盘上的 CAS 物理分片（按内容哈希寻址）
   const storage = process.env.STORAGE_DIR;
-  const part = path.join(storage, 'chunks', fileId, '00000000.part');
+  const part = path.join(storage, 'cas', hashes[0].slice(0, 2), `${hashes[0]}.part`);
   await fsp.writeFile(part, Buffer.from('xxxxxxxx'));
 
   const done = await call('POST', `/${fileId}/complete`);
@@ -303,6 +314,446 @@ console.log('场景 5：空文件 0 分片，聚合哈希为空哈希链，正�
   const mergedAbs = path.join(process.env.STORAGE_DIR, done.json.mergedPath);
   const stat = await fsp.stat(mergedAbs);
   check('合并产物为 0 字节文件', stat.size === 0);
+}
+
+/* ---------------- 场景 6：分阶段任务（先 init(无哈希) → 边传边补 → complete） ---------------- */
+console.log('场景 6：分阶段任务：init 无 fileHash，上传与补报哈希交错，最后 complete');
+{
+  const content = Buffer.from('PIPELINE-'.repeat(1000)); // 9000B
+  const fileName = 'pipeline.bin';
+  const chunkSize = 3000;
+  const totalChunks = 3;
+  const chunkBufs = [
+    content.subarray(0, 3000),
+    content.subarray(3000, 6000),
+    content.subarray(6000),
+  ];
+  const chunkHashes = chunkBufs.map(sha256);
+  const fileHash = sha256Text(chunkHashes.join(''));
+  const fileId = sha256Text(`${fileName}:${content.length}:1700000000010:${chunkSize}`);
+
+  const init = await call(
+    'POST',
+    '/init',
+    JSON.stringify({ fileId, fileName, fileSize: content.length, chunkSize, totalChunks, fileHash: null }),
+    { 'Content-Type': 'application/json' },
+  );
+  check('分阶段 init 201 且 fileHash=null/hashLocked=false',
+    init.status === 201 &&
+    init.json.file.fileHash === null &&
+    init.json.file.hashLocked === false);
+
+  // complete 在补哈希之前 → 明确报错，任务不卡死
+  const early = await call('POST', `/${fileId}/complete`);
+  check('未补哈希就 complete 返回 409 FILE_HASH_REQUIRED 且状态保持 uploading',
+    early.status === 409 &&
+    early.json.error.code === 'FILE_HASH_REQUIRED' &&
+    (await call('GET', `/${fileId}/status`)).json.status === 'uploading');
+
+  // 哈希未补报时即可接收分片（分阶段上传）
+  const up0 = await call('POST', `/${fileId}/chunks/0?hash=${chunkHashes[0]}`, chunkBufs[0]);
+  check('补哈希前允许上传分片', up0.status === 201);
+
+  // 补报哈希
+  const hashResp = await call(
+    'POST',
+    `/${fileId}/hash`,
+    JSON.stringify({ fileHash }),
+    { 'Content-Type': 'application/json' },
+  );
+  check('首次 /hash 201 locked=true changed=true',
+    hashResp.status === 201 && hashResp.json.locked === true && hashResp.json.changed === true);
+
+  // 重复相同哈希 → 幂等
+  const hashAgain = await call(
+    'POST',
+    `/${fileId}/hash`,
+    JSON.stringify({ fileHash }),
+    { 'Content-Type': 'application/json' },
+  );
+  check('相同 /hash 重复提交 200 changed=false',
+    hashAgain.status === 200 && hashAgain.json.changed === false);
+
+  // 提交不同哈希 → 冲突锁定
+  const hashConflict = await call(
+    'POST',
+    `/${fileId}/hash`,
+    JSON.stringify({ fileHash: 'b'.repeat(64) }),
+    { 'Content-Type': 'application/json' },
+  );
+  check('不同 /hash 返回 409 FILE_HASH_LOCKED',
+    hashConflict.status === 409 && hashConflict.json.error.code === 'FILE_HASH_LOCKED');
+
+  // init 带 fileHash 恢复时也能把空哈希补登记
+  const otherId = sha256Text(`${fileName}-x:${content.length}:1700000000011:${chunkSize}`);
+  await call(
+    'POST',
+    '/init',
+    JSON.stringify({ fileId: otherId, fileName: `${fileName}-x`, fileSize: content.length, chunkSize, totalChunks, fileHash: null }),
+    { 'Content-Type': 'application/json' },
+  );
+  const resumeWithHash = await call(
+    'POST',
+    '/init',
+    JSON.stringify({ fileId: otherId, fileName: `${fileName}-x`, fileSize: content.length, chunkSize, totalChunks, fileHash }),
+    { 'Content-Type': 'application/json' },
+  );
+  check('恢复 init 带哈希可补登记 hashLocked=true',
+    resumeWithHash.status === 200 && resumeWithHash.json.file.hashLocked === true);
+
+  // 补齐剩余分片
+  await call('POST', `/${fileId}/chunks/1?hash=${chunkHashes[1]}`, chunkBufs[1]);
+  await call('POST', `/${fileId}/chunks/2?hash=${chunkHashes[2]}`, chunkBufs[2]);
+  const done = await call('POST', `/${fileId}/complete`);
+  check('分阶段任务 complete 成功且聚合哈希一致',
+    done.status === 200 && done.json.aggregateHash === fileHash);
+
+  // 完成后 /hash 也被拒绝
+  const hashAfterDone = await call(
+    'POST',
+    `/${fileId}/hash`,
+    JSON.stringify({ fileHash }),
+    { 'Content-Type': 'application/json' },
+  );
+  check('完成后补哈希返回 409', hashAfterDone.status === 409);
+}
+
+/* ---------------- 场景 7：并发安全——complete 期间的分片/重复 complete 被拒绝 ---------------- */
+console.log('场景 7：并发：complete 与分片上传/二次 complete 竞争，merging 状态必须拦截');
+{
+  const fileName = 'race.bin';
+  const chunkSize = 4;
+  const content = Buffer.from('abcdEFGH'); // 8B → 2 片
+  const hashes = [sha256(content.subarray(0, 4)), sha256(content.subarray(4))];
+  const fileHash = sha256Text(hashes.join(''));
+  const fileId = sha256Text(`${fileName}:${content.length}:1700000000012:${chunkSize}`);
+  await call(
+    'POST',
+    '/init',
+    JSON.stringify({ fileId, fileName, fileSize: content.length, chunkSize, totalChunks: 2, fileHash }),
+    { 'Content-Type': 'application/json' },
+  );
+  await call('POST', `/${fileId}/chunks/0?hash=${hashes[0]}`, content.subarray(0, 4));
+  await call('POST', `/${fileId}/chunks/1?hash=${hashes[1]}`, content.subarray(4));
+
+  // 同步并发两次 complete（mock DB 下无真锁，但状态机必须接受其一）
+  const [c1, c2] = await Promise.all([
+    call('POST', `/${fileId}/complete`),
+    call('POST', `/${fileId}/complete`),
+  ]);
+  const codes = [c1.status, c2.status].sort().join(',');
+  check(
+    `并发 complete 结果为 200+409（实际 ${c1.status},${c2.status}）`,
+    c1.status === 200 && c2.status === 409 && c2.json.error.code === 'FILE_VERIFYING',
+  );
+  check('状态码组合校验: ' + codes, codes === '200,409');
+
+  // merging/completed 后上传均被拒绝（completed → FILE_ALREADY_VERIFIED）
+  const upAfter = await call('POST', `/${fileId}/chunks/0?hash=${hashes[0]}`, content.subarray(0, 4));
+  check('完成后并发残留上传被拒绝 409', upAfter.status === 409);
+}
+
+/* ---------------- 场景 8：分阶段任务完成时仍能抓坏片（磁盘篡改） ---------------- */
+console.log('场景 8：分阶段流程下篡改磁盘分片，complete 强校验依旧检出');
+{
+  const fileName = 'pipeline-tampered.bin';
+  const chunkSize = 8;
+  const content = Buffer.from('ZZZZZZZzyyyyyyyy'); // 16B → 2 片
+  const hashes = [sha256(content.subarray(0, 8)), sha256(content.subarray(8))];
+  const fileHash = sha256Text(hashes.join(''));
+  const fileId = sha256Text(`${fileName}:${content.length}:1700000000013:${chunkSize}`);
+
+  await call(
+    'POST',
+    '/init',
+    JSON.stringify({ fileId, fileName, fileSize: content.length, chunkSize, totalChunks: 2, fileHash: null }),
+    { 'Content-Type': 'application/json' },
+  );
+  await call('POST', `/${fileId}/chunks/0?hash=${hashes[0]}`, content.subarray(0, 8));
+  await call('POST', `/${fileId}/chunks/1?hash=${hashes[1]}`, content.subarray(8));
+  await call('POST', `/${fileId}/hash`, JSON.stringify({ fileHash }), {
+    'Content-Type': 'application/json',
+  });
+
+  const part = path.join(process.env.STORAGE_DIR, 'cas', hashes[1].slice(0, 2), `${hashes[1]}.part`);
+  await fsp.writeFile(part, Buffer.from('TAMPERED'));
+
+  const done = await call('POST', `/${fileId}/complete`);
+  check('分阶段任务篡改分片仍被 422 检出',
+    done.status === 422 && done.json.error.code === 'CHUNK_HASH_MISMATCH');
+  const status = await call('GET', `/${fileId}/status`);
+  check('检出后状态回退 uploading，允许重传修复', status.json.status === 'uploading');
+}
+
+/* ---------------- 场景 9：相同大文件第二次秒传（零上传） ---------------- */
+console.log('场景 9：相同文件不同 fileId，带清单 init 直接秒传，零上传');
+{
+  // 12 字节，3 片
+  const content = Buffer.from('ABCDEFGHIJKL');
+  const chunkSize = 4;
+  const parts = [content.subarray(0, 4), content.subarray(4, 8), content.subarray(8, 12)];
+  const hashes = parts.map(sha256);
+  const agg = sha256Text(hashes.join(''));
+  const mergedHash = sha256(content);
+
+  const idA = sha256Text(`movie-a.bin:${content.length}:1700000001001:${chunkSize}`);
+  const initA = await call(
+    'POST',
+    '/init',
+    JSON.stringify({
+      fileId: idA, fileName: 'movie-a.bin', fileSize: content.length, chunkSize,
+      totalChunks: 3, fileHash: agg, chunkHashes: hashes,
+    }),
+    { 'Content-Type': 'application/json' },
+  );
+  check('文件A 首次无秒传', initA.status === 201 && initA.json.instant === false);
+
+  for (let i = 0; i < 3; i++) {
+    await call('POST', `/${idA}/chunks/${i}?hash=${hashes[i]}`, parts[i]);
+  }
+  const doneA = await call('POST', `/${idA}/complete`);
+  check('文件A complete 成功', doneA.status === 200);
+  const casPath = path.join(process.env.STORAGE_DIR, 'cas', hashes[0].slice(0, 2), `${hashes[0]}.part`);
+  check('CAS 物理分片按内容寻址落盘', await fsp.access(casPath).then(() => true).catch(() => false));
+
+  // 文件B：内容完全相同（同聚合哈希），但 fileId/文件名不同 → 秒传
+  const idB = sha256Text(`movie-copy.bin:${content.length}:1700000001002:${chunkSize}`);
+  const initB = await call(
+    'POST',
+    '/init',
+    JSON.stringify({
+      fileId: idB, fileName: 'movie-copy.bin', fileSize: content.length, chunkSize,
+      totalChunks: 3, fileHash: agg, chunkHashes: hashes,
+    }),
+    { 'Content-Type': 'application/json' },
+  );
+  check('文件B 带清单 init 秒传 instant=true/status=completed',
+    initB.status === 200 && initB.json.instant === true && initB.json.file.status === 'completed');
+  check('秒传返回已有合并哈希', initB.json.file.mergedHash === mergedHash);
+  check('秒传返回全部分片关联', initB.json.uploadedChunks.length === 3);
+
+  // 不发任何分片直接 complete/下载：文件B 应已可下载（共享合并产物）
+  const dl = await fetch(`http://localhost:${port}/api/files/${idB}/download`);
+  const dlBuf = Buffer.from(await dl.arrayBuffer());
+  check('秒传文件可直接下载且字节一致',
+    dl.status === 200 && Buffer.compare(dlBuf, content) === 0);
+
+  // precheck 只读接口也应返回 instant
+  const pre = await call(
+    'POST',
+    '/precheck',
+    JSON.stringify({ fileHash: agg, chunkHashes: hashes }),
+    { 'Content-Type': 'application/json' },
+  );
+  check('precheck 返回 instant=true', pre.json.instant === true);
+
+  // 全引用都在 → GC 不删任何物理分片
+  const gc1 = await gcCall(0);
+  check('两个文件引用期间 GC 删除 0 个分片', gc1.json.removedChunks === 0);
+}
+
+/* ---------------- 场景 10：跨文件共享部分分片，物理只存一份 ---------------- */
+console.log('场景 10：不同文件共享部分相同内容分片（去重）');
+{
+  const shared = Buffer.from('SHARED-PAYLOAD!!'); // 16B
+  const onlyA = Buffer.from('AAAA-suffix-data'); // 16B
+  const onlyB = Buffer.from('BBBB-suffix-data'); // 16B
+  const chunkSize = 16;
+  const hShared = sha256(shared);
+  const hOnlyA = sha256(onlyA);
+  const hOnlyB = sha256(onlyB);
+
+  const contentA = Buffer.concat([shared, onlyA]);
+  const contentB = Buffer.concat([shared, onlyB]);
+  const hashesA = [hShared, hOnlyA];
+  const hashesB = [hShared, hOnlyB];
+  const aggA = sha256Text(hashesA.join(''));
+  const aggB = sha256Text(hashesB.join(''));
+  const idA = sha256Text(`doc-A:${contentA.length}:1700000002001:${chunkSize}`);
+  const idB = sha256Text(`doc-B:${contentB.length}:1700000002002:${chunkSize}`);
+
+  await call('POST', '/init', JSON.stringify({
+    fileId: idA, fileName: 'doc-A.bin', fileSize: contentA.length, chunkSize,
+    totalChunks: 2, fileHash: aggA, chunkHashes: hashesA,
+  }), { 'Content-Type': 'application/json' });
+  await call('POST', `/${idA}/chunks/0?hash=${hShared}`, shared);
+  await call('POST', `/${idA}/chunks/1?hash=${hOnlyA}`, onlyA);
+  const doneA = await call('POST', `/${idA}/complete`);
+  check('文件A 完成', doneA.status === 200);
+
+  // 文件B 上传：分片0 是去重命中（同 chunkHash 物理已存在），分片1 全新
+  await call('POST', '/init', JSON.stringify({
+    fileId: idB, fileName: 'doc-B.bin', fileSize: contentB.length, chunkSize,
+    totalChunks: 2, fileHash: aggB, chunkHashes: hashesB,
+  }), { 'Content-Type': 'application/json' });
+  const upShared = await call('POST', `/${idB}/chunks/0?hash=${hShared}`, shared);
+  check('共享分片上传返回 dedup=true（物理复用，不重复落盘）',
+    upShared.status === 201 && upShared.json.dedup === true);
+  const upNew = await call('POST', `/${idB}/chunks/1?hash=${hOnlyB}`, onlyB);
+  check('新分片 dedup=false', upNew.json.dedup === false);
+  const doneB = await call('POST', `/${idB}/complete`);
+  check('文件B 完成', doneB.status === 200);
+
+  // 物理只有一份共享分片
+  const casShared = path.join(process.env.STORAGE_DIR, 'cas', hShared.slice(0, 2), `${hShared}.part`);
+  check('共享分片物理只存一份', await fsp.access(casShared).then(() => true).catch(() => false));
+  const dlB = await fetch(`http://localhost:${port}/api/files/${idB}/download`);
+  check('文件B 下载内容正确（含共享头）',
+    Buffer.compare(Buffer.from(await dlB.arrayBuffer()), contentB) === 0);
+
+  // 保存给场景 11 使用（全局变量）
+  globalThis.__shareCase = { idA, idB, hShared, hOnlyA, hOnlyB, chunkSize, contentB, aggB };
+}
+
+/* ---------------- 场景 11：删 A 不影响其它文件的 complete/下载（引用计数保护） ---------------- */
+console.log('场景 11：删除共享方 A 后，未完成文件仍可 complete，已完成文件仍可下载');
+{
+  const c = globalThis.__shareCase;
+
+  // 再建第三个文件 B2，内容与 B 相同，但此刻不带清单/哈希，处于上传中
+  const idB2 = sha256Text(`doc-B-pending:${c.contentB.length}:1700000003001:${c.chunkSize}`);
+  await call('POST', '/init', JSON.stringify({
+    fileId: idB2, fileName: 'doc-B-pending.bin', fileSize: c.contentB.length,
+    chunkSize: c.chunkSize, totalChunks: 2, fileHash: null,
+  }), { 'Content-Type': 'application/json' });
+  // 两个分片都是全局已存在内容（dedup 命中）
+  const up0 = await call('POST', `/${idB2}/chunks/0?hash=${c.hShared}`, c.contentB.subarray(0, 16));
+  const up1 = await call('POST', `/${idB2}/chunks/1?hash=${c.hOnlyB}`, c.contentB.subarray(16));
+  check('B2 上传命中全局去重（dedup=true）', up0.json.dedup === true && up1.json.dedup === true);
+
+  // 删除 A（引用 shared + onlyA）。B、B2 都引用 shared，故 shared 不能被回收
+  const delA = await call('DELETE', `/${c.idA}`);
+  check('删除 A 成功，仅解除引用（physicalRemoved=false）',
+    delA.status === 200 && delA.json.deleted === true && delA.json.physicalRemoved === false);
+  check('A 解除了 2 个分片引用', delA.json.dereferencedChunks === 2);
+
+  // 立即 GC（minAge=0）：onlyA 归零可回收；shared 仍被 B、B2 引用
+  const gc = await gcCall(0);
+  check('删 A 后 GC 只回收归零的 onlyA（shared 仍被引用）', gc.json.removedChunks === 1);
+
+  // A 已删，但 B2 仍可补哈希并 complete（强校验读的是仍存活的共享 CAS 分片）
+  const aggB2 = sha256Text([c.hShared, c.hOnlyB].join(''));
+  const lock = await call('POST', `/${idB2}/hash`, JSON.stringify({ fileHash: aggB2 }), {
+    'Content-Type': 'application/json',
+  });
+  check('B2 删除 A 后补报哈希成功', lock.status === 201);
+  const doneB2 = await call('POST', `/${idB2}/complete`);
+  check('删除 A 后 B2 仍可 complete（共享分片存活）', doneB2.status === 200);
+
+  // 已完成的 B 仍可下载
+  const dlB = await fetch(`http://localhost:${port}/api/files/${c.idB}/download`);
+  check('删除 A 后 B 仍可下载且内容正确',
+    dlB.status === 200 &&
+    Buffer.compare(Buffer.from(await dlB.arrayBuffer()), c.contentB) === 0);
+
+  const casShared = path.join(process.env.STORAGE_DIR, 'cas', c.hShared.slice(0, 2), `${c.hShared}.part`);
+  check('被引用的共享分片物理仍在', await fsp.access(casShared).then(() => true).catch(() => false));
+  const casOnlyA = path.join(process.env.STORAGE_DIR, 'cas', c.hOnlyA.slice(0, 2), `${c.hOnlyA}.part`);
+  check('归零的 onlyA 物理分片已被 GC 删除',
+    await fsp.access(casOnlyA).then(() => false).catch(() => true));
+
+  globalThis.__shareCase.idB2 = idB2;
+}
+
+/* ---------------- 场景 12：引用归零后 GC 删除物理，合并产物同步回收 ---------------- */
+console.log('场景 12：最后一个引用删除后，GC 回收分片与合并产物');
+{
+  const c = globalThis.__shareCase;
+  const delB = await call('DELETE', `/${c.idB}`);
+  check('删除 B 成功', delB.status === 200);
+  // B2 与 B 内容相同，仍引用 shared/onlyB，故此刻 GC 不回收
+  const gcBusy = await gcCall(0);
+  check('B2 仍引用期间 GC 不回收（removedChunks=0）', gcBusy.json.removedChunks === 0);
+
+  // 删除最后一个引用 B2 后再 GC
+  const delB2 = await call('DELETE', `/${c.idB2}`);
+  check('删除 B2 成功', delB2.status === 200);
+  const gc = await gcCall(0);
+  check('所有引用删除后 GC 回收剩余 2 个分片', gc.json.removedChunks === 2);
+  check('合并产物引用归零后被 GC 回收', gc.json.removedMerged >= 1);
+  const casShared = path.join(process.env.STORAGE_DIR, 'cas', c.hShared.slice(0, 2), `${c.hShared}.part`);
+  check('共享分片物理最终被删除',
+    await fsp.access(casShared).then(() => false).catch(() => true));
+
+  // 删除不存在的文件 → 404
+  const ghost = await call('DELETE', `/${c.idA}`);
+  check('重复删除返回 404', ghost.status === 404);
+}
+
+/* ---------------- 场景 13：同一 chunkHash 并发首传幂等，只落盘一份、计数正确 ---------------- */
+console.log('场景 13：两个新文件并发首传相同 chunkHash，幂等且引用计数正确');
+{
+  const body = Buffer.from('concurrent-identical-chunk!!!'); // 30B 一片
+  const h = sha256(body);
+  const chunkSize = body.length;
+  const agg = sha256Text(h);
+  const idX = sha256Text(`race-X:${body.length}:1700000004001:${chunkSize}`);
+  const idY = sha256Text(`race-Y:${body.length}:1700000004002:${chunkSize}`);
+
+  await call('POST', '/init', JSON.stringify({
+    fileId: idX, fileName: 'x.bin', fileSize: body.length, chunkSize,
+    totalChunks: 1, fileHash: agg, chunkHashes: [h],
+  }), { 'Content-Type': 'application/json' });
+  await call('POST', '/init', JSON.stringify({
+    fileId: idY, fileName: 'y.bin', fileSize: body.length, chunkSize,
+    totalChunks: 1, fileHash: agg, chunkHashes: [h],
+  }), { 'Content-Type': 'application/json' });
+
+  // 并发首传同一 hash（不同 fileId、同序号 0）
+  const [rx, ry] = await Promise.all([
+    call('POST', `/${idX}/chunks/0?hash=${h}`, body),
+    call('POST', `/${idY}/chunks/0?hash=${h}`, body),
+  ]);
+  check('两个并发首传都成功（201）', rx.status === 201 && ry.status === 201);
+
+  // 两边都能 complete（共享同一物理分片，引用计数=2）
+  const cx = await call('POST', `/${idX}/complete`);
+  const cy = await call('POST', `/${idY}/complete`);
+  check('两个并发文件都 complete 成功', cx.status === 200 && cy.status === 200);
+
+  // 删一个，GC 不能删物理分片（还被另一个引用）
+  await call('DELETE', `/${idX}`);
+  const gc = await gcCall(0);
+  check('删其一后并发共享分片不被 GC（removedChunks=0）', gc.json.removedChunks === 0);
+  const dlY = await fetch(`http://localhost:${port}/api/files/${idY}/download`);
+  check('剩余文件仍可下载', dlY.status === 200);
+
+  // 同文件重复传同 hash：幂等 skipped（用独立内容，避免触发秒传）
+  const zb = Buffer.from('unique-idempotent-content!!!');
+  const hz = sha256(zb);
+  const idZ = sha256Text(`race-Z:${zb.length}:1700000004003:${zb.length}`);
+  await call('POST', '/init', JSON.stringify({
+    fileId: idZ, fileName: 'z.bin', fileSize: zb.length, chunkSize: zb.length,
+    totalChunks: 1, fileHash: null,
+  }), { 'Content-Type': 'application/json' });
+  const z1 = await call('POST', `/${idZ}/chunks/0?hash=${hz}`, zb);
+  const z2 = await call('POST', `/${idZ}/chunks/0?hash=${hz}`, zb);
+  check('同文件重复传：首传 201，重传 skipped=true',
+    z1.status === 201 && z2.status === 200 && z2.json.skipped === true);
+}
+
+/* ---------------- 场景 14：未完成文件禁止下载；路径不可遍历 ---------------- */
+console.log('场景 14：未完成文件下载被拒；非法 hash/fileId 返回 400');
+{
+  const content = Buffer.from('not-ready-yet!!');
+  const chunkSize = content.length;
+  const h = sha256(content);
+  const id = sha256Text(`pending-dl:${content.length}:1700000005001:${chunkSize}`);
+  await call('POST', '/init', JSON.stringify({
+    fileId: id, fileName: 'pending.bin', fileSize: content.length, chunkSize,
+    totalChunks: 1, fileHash: sha256Text(h), chunkHashes: [h],
+  }), { 'Content-Type': 'application/json' });
+  await call('POST', `/${id}/chunks/0?hash=${h}`, content);
+  // 未 complete
+  const dl = await fetch(`http://localhost:${port}/api/files/${id}/download`);
+  check('未完成文件下载返回 409 FILE_NOT_READY',
+    dl.status === 409);
+
+  // 非法 fileId / hash
+  const badId = await fetch(`http://localhost:${port}/api/files/../etc/passwd/status`);
+  check('路径遍历被路由/校验拦截（非 200）', badId.status !== 200);
+  const badHash = await call('POST', '/not-a-valid-hash/chunks/0?hash=x', Buffer.from('a'));
+  check('非法 fileId 返回 400', badHash.status === 400);
 }
 
 server.close();

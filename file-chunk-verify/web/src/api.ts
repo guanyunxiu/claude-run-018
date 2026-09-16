@@ -1,12 +1,19 @@
 /**
  * Fetch 接口封装。开发环境经 Vite /api 代理到 :3000；
  * 生产环境可把 BASE 改为同源或网关地址。
+ *
+ * 分阶段任务时序：
+ *   init(fileHash 可空) → 分片上传 与 POST /hash 可交错 → complete
  */
 import type {
   ChunkListResponse,
   ChunkUploadResponse,
   CompleteResponse,
+  DeleteResponse,
+  GcResponse,
   InitResponse,
+  PrecheckResponse,
+  SubmitHashResponse,
 } from './types';
 import type { ApiErrorBody } from './types';
 
@@ -47,7 +54,10 @@ export interface InitParams {
   fileSize: number;
   chunkSize: number;
   totalChunks: number;
-  fileHash: string;
+  /** 分阶段流水线：init 时尚未算完，允许为 null */
+  fileHash: string | null;
+  /** 全部已知时（全量缓存/算完）携带分片哈希清单，用于秒传与 CAS 命中预检 */
+  chunkHashes?: string[] | null;
 }
 
 export async function initFile(params: InitParams): Promise<InitResponse> {
@@ -58,6 +68,53 @@ export async function initFile(params: InitParams): Promise<InitResponse> {
   });
   if (!res.ok) throw await parseError(res);
   return (await res.json()) as InitResponse;
+}
+
+/** 只读预检：返回是否可秒传 + 全局 CAS 分片命中（不产生副作用） */
+export async function precheck(params: {
+  fileHash: string | null;
+  chunkHashes: string[];
+}): Promise<PrecheckResponse> {
+  const res = await fetch(`${BASE}/precheck`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(params),
+  });
+  if (!res.ok) throw await parseError(res);
+  return (await res.json()) as PrecheckResponse;
+}
+
+/** 删除文件任务（仅解除引用；物理对象由 GC 在引用归零时回收） */
+export async function deleteFile(fileId: string): Promise<DeleteResponse> {
+  const res = await fetch(`${BASE}/${fileId}`, { method: 'DELETE' });
+  if (!res.ok) throw await parseError(res);
+  return (await res.json()) as DeleteResponse;
+}
+
+/** 手动触发孤儿 CAS 对象垃圾回收（挂载于 /api/admin/gc） */
+export async function runGc(minAgeSec = 0): Promise<GcResponse> {
+  const adminBase = BASE.replace(/\/files$/, '/admin');
+  const res = await fetch(`${adminBase}/gc`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ minAgeSec }),
+  });
+  if (!res.ok) throw await parseError(res);
+  return (await res.json()) as GcResponse;
+}
+
+/** 补报/锁定聚合哈希。相同值重复提交幂等；不同值服务端返回 FILE_HASH_LOCKED */
+export async function submitFileHash(
+  fileId: string,
+  fileHash: string,
+): Promise<SubmitHashResponse> {
+  const res = await fetch(`${BASE}/${fileId}/hash`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ fileHash }),
+  });
+  if (!res.ok) throw await parseError(res);
+  return (await res.json()) as SubmitHashResponse;
 }
 
 export async function listChunks(fileId: string): Promise<ChunkListResponse> {

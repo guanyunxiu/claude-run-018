@@ -1,28 +1,38 @@
 /**
- * 分片上传编排：
- *  1. 顺序从 File 切片（Blob.slice，不产生内存副本）；
- *  2. 每个切片 arrayBuffer() 后以 Transferable 交给【唯一】的 WebWorker 算 SHA-256；
- *  3. 由全分片哈希计算聚合哈希 fileHash；
- *  4. 调 /init 获取服务端已上传分片（断点续传），序号+哈希命中即跳过；
- *  5. 未上传分片用有界并发池（默认 3）上传，网络/5xx 自动重试 2 次；
- *  6. 全部完成后调 /complete，由服务端重算哈希并聚合校验、合并文件。
+ * 上传编排（真实依赖装配，CAS v3）：
  *
- * 同一时刻 Worker 中只保留一个分片 buffer，上传分片随用随切，
- * 即便文件是 GB 级，浏览器内存占用也基本恒定。
+ *  A. 全量分片哈希已在 IndexedDB（上次算完/刷新）→ init 直接带清单：
+ *       命中已完成相同文件 → 秒传（零读取/零哈希/零上传）
+ *       否则按返回 hits（本任务关联 + 全局 CAS）跳过，未命中分片只读字节上传
+ *  B. 否则分阶段 init（无清单）→ 启动有界流水线边算边传；
+ *       全部分片哈希算出的瞬间用「带清单 init」做秒传仲裁：
+ *         命中 → 中止剩余上传；未命中 → 把全局 CAS hits 补进跳过集合继续。
+ *
+ * 物理分片由后端按 chunkHash 内容寻址去重；删除只减引用，GC 回收零引用对象。
  */
 import HashWorker from './hash.worker?worker';
 import {
   ApiException,
   completeFile,
   initFile,
+  submitFileHash,
   uploadChunk,
 } from './api';
+import { IndexedDbHashCache, type HashCacheMeta } from './idb-cache';
+import {
+  runPipeline,
+  type HashCache,
+  type HashSink,
+  type ChunkReader,
+  type RemoteChunks,
+} from './pipeline';
 import type { CompleteResponse, InitResponse } from './types';
 
 export type UploadPhase =
-  | 'hashing'
   | 'init'
-  | 'uploading'
+  | 'instant-done'
+  | 'pipeline'
+  | 'locking-hash'
   | 'completing'
   | 'done';
 
@@ -30,31 +40,37 @@ export interface UploadProgress {
   phase: UploadPhase;
   totalChunks: number;
   totalBytes: number;
-  /** 已完成哈希的分片数 / 字节数 */
   hashedChunks: number;
+  hashCacheReused: number;
   hashedBytes: number;
-  /** 已确认落位的分片（服务端已有 + 本次新传） */
+  hashing: boolean;
+  uploading: boolean;
+  queuedChunks: number;
+  inflightChunks: number;
   settledChunks: number;
-  /** 已确认落位字节，用于整体百分比 */
   settledBytes: number;
-  /** 本次新上传字节 */
+  serverSkippedChunks: number;
+  globalDedupChunks: number;
+  newlyUploadedChunks: number;
   newlyUploadedBytes: number;
-  /** 本次跳过（断点续传命中）分片数 */
-  skippedChunks: number;
-  /** 上传阶段估算速度（字节/秒，含 0） */
   bytesPerSec: number;
 }
 
 export interface UploadResult {
+  instant: boolean;
   init: InitResponse;
-  complete: CompleteResponse;
-  skippedChunks: number;
+  complete: CompleteResponse | null;
+  serverSkippedChunks: number;
+  globalDedupChunks: number;
+  hashCacheReused: number;
+  newlyUploadedChunks: number;
 }
 
 export interface UploadFileOptions {
   file: File;
   chunkSize: number;
-  concurrency?: number;
+  maxInflight?: number;
+  uploadConcurrency?: number;
   signal?: AbortSignal;
   onLog?: (message: string) => void;
   onProgress?: (progress: UploadProgress) => void;
@@ -70,28 +86,19 @@ function toHex(buffer: ArrayBuffer): string {
 }
 
 async function sha256OfText(text: string): Promise<string> {
-  const digest = await crypto.subtle.digest(
-    'SHA-256',
-    new TextEncoder().encode(text),
+  return toHex(
+    await crypto.subtle.digest('SHA-256', new TextEncoder().encode(text)),
   );
-  return toHex(digest);
 }
 
-/** 单个分片的期望大小（最后一片可能更小） */
 function chunkLength(fileSize: number, chunkSize: number, index: number): number {
-  const start = index * chunkSize;
-  return Math.min(chunkSize, fileSize - start);
+  return Math.min(chunkSize, fileSize - index * chunkSize);
 }
 
-/** 聚合哈希：sha256(concat(各分片 sha256 的 hex))，与后端 aggregateHashHex 严格一致 */
 async function aggregateHash(chunkHashes: string[]): Promise<string> {
   return sha256OfText(chunkHashes.join(''));
 }
 
-/**
- * 文件 ID：同一文件（文件名 + 大小 + 最后修改时间）在同一分片策略下稳定，
- * 作为断点续传的会话标识。
- */
 async function computeFileId(
   fileName: string,
   fileSize: number,
@@ -101,13 +108,12 @@ async function computeFileId(
   return sha256OfText(`${fileName}:${fileSize}:${lastModified}:${chunkSize}`);
 }
 
-/* ---------------- 单 Worker 的 Promise 化封装 ---------------- */
+/* ---------------- 单 Worker 串行哈希器 ---------------- */
 
 interface WorkerOk {
   id: number;
   index: number;
   hash: string;
-  size: number;
 }
 interface WorkerErr {
   id: number;
@@ -116,14 +122,12 @@ interface WorkerErr {
 }
 type WorkerMessage = WorkerOk | WorkerErr;
 
-interface Pending {
-  resolve: (hash: string) => void;
-  reject: (err: Error) => void;
-}
-
-class SingleHashWorker {
+class SingleHashWorker implements HashSink {
   private readonly worker: Worker;
-  private readonly pending = new Map<number, Pending>();
+  private readonly pending = new Map<
+    number,
+    { resolve: (h: string) => void; reject: (e: Error) => void }
+  >();
   private nextId = 1;
 
   constructor() {
@@ -146,7 +150,6 @@ class SingleHashWorker {
     };
   }
 
-  /** 计算 buffer 的 SHA-256；buffer 以 Transferable 所有权转移给 Worker（零拷贝） */
   hash(index: number, buffer: ArrayBuffer): Promise<string> {
     const id = this.nextId++;
     return new Promise<string>((resolve, reject) => {
@@ -163,28 +166,25 @@ class SingleHashWorker {
   }
 }
 
-/* ---------------- 有界并发任务池 ---------------- */
-
-async function runPool<T>(
-  items: T[],
-  concurrency: number,
-  signal: AbortSignal | undefined,
-  workerFn: (item: T) => Promise<void>,
-): Promise<void> {
-  let cursor = 0;
-  const runners = Array.from({ length: Math.min(concurrency, items.length) }, async () => {
-    while (cursor < items.length) {
-      const current = cursor++;
-      if (signal?.aborted) {
-        throw new DOMException('用户取消上传', 'AbortError');
-      }
-      await workerFn(items[current]);
-    }
-  });
-  await Promise.all(runners);
+class IdbCacheAdapter implements HashCache {
+  constructor(
+    private readonly cache: IndexedDbHashCache,
+    private readonly meta: Omit<HashCacheMeta, 'cursor'>,
+  ) {}
+  loadPrefix() {
+    return this.cache.loadPrefix({
+      fileId: this.meta.fileId,
+      fileName: this.meta.fileName,
+      fileSize: this.meta.fileSize,
+      lastModified: this.meta.lastModified,
+      chunkSize: this.meta.chunkSize,
+    });
+  }
+  put(index: number, hash: string, size: number) {
+    return this.cache.putChunk(this.meta, { index, hash, size });
+  }
 }
 
-/** 网络错误 / 5xx 自动重试；4xx（如哈希不符）直接抛出 */
 async function withRetry<T>(
   fn: () => Promise<T>,
   signal: AbortSignal | undefined,
@@ -215,135 +215,287 @@ export async function uploadFileInChunks(
   const {
     file,
     chunkSize,
-    concurrency = 3,
+    maxInflight = 6,
+    uploadConcurrency = 3,
     signal,
     onLog,
     onProgress,
   } = options;
 
-  if (!Number.isInteger(chunkSize) || chunkSize < 1) {
-    throw new Error('分片大小非法');
-  }
+  if (!Number.isInteger(chunkSize) || chunkSize < 1) throw new Error('分片大小非法');
+  if (maxInflight < uploadConcurrency) throw new Error('maxInflight 必须 >= uploadConcurrency');
 
   const log = (msg: string) => onLog?.(msg);
   const totalChunks = file.size === 0 ? 0 : Math.ceil(file.size / chunkSize);
+  const sizeOf = (index: number) => chunkLength(file.size, chunkSize, index);
 
   const progress: UploadProgress = {
-    phase: 'hashing',
+    phase: 'init',
     totalChunks,
     totalBytes: file.size,
     hashedChunks: 0,
+    hashCacheReused: 0,
     hashedBytes: 0,
+    hashing: false,
+    uploading: false,
+    queuedChunks: 0,
+    inflightChunks: 0,
     settledChunks: 0,
     settledBytes: 0,
+    serverSkippedChunks: 0,
+    globalDedupChunks: 0,
+    newlyUploadedChunks: 0,
     newlyUploadedBytes: 0,
-    skippedChunks: 0,
     bytesPerSec: 0,
   };
   const emit = () => onProgress?.({ ...progress });
   emit();
 
+  const fileId = await computeFileId(
+    file.name,
+    file.size,
+    file.lastModified,
+    chunkSize,
+  );
+  log(`文件 ID：${fileId}`);
+
+  const idb = new IndexedDbHashCache();
   const worker = new SingleHashWorker();
-
-  try {
-    /* 阶段 1：单 Worker 顺序扫描全分片哈希（同时也完成了一次本地“读校验”） */
-    log(`开始计算 ${totalChunks} 个分片的 SHA-256（Worker 线程）…`);
-    const chunkHashes: string[] = new Array(totalChunks);
-    for (let i = 0; i < totalChunks; i++) {
-      if (signal?.aborted) throw new DOMException('用户取消上传', 'AbortError');
-      const start = i * chunkSize;
-      const blob = file.slice(start, start + chunkLength(file.size, chunkSize, i));
-      const buffer = await blob.arrayBuffer();
-      chunkHashes[i] = await worker.hash(i, buffer);
-      progress.hashedChunks = i + 1;
-      progress.hashedBytes = Math.min(start + blob.size, file.size);
-      emit();
-    }
-    const fileHash = await aggregateHash(chunkHashes);
-    log(`分片哈希完成，聚合哈希：${fileHash}`);
-
-    /* 阶段 2：init 注册/恢复，拿到已上传分片清单 */
-    progress.phase = 'init';
-    emit();
-    const fileId = await computeFileId(
+  const cacheMeta: Omit<HashCacheMeta, 'cursor'> = {
+    fileId,
+    fingerprint: IndexedDbHashCache.makeFingerprint(
       file.name,
       file.size,
       file.lastModified,
       chunkSize,
-    );
-    log(`文件 ID：${fileId}`);
+    ),
+    fileName: file.name,
+    fileSize: file.size,
+    lastModified: file.lastModified,
+    chunkSize,
+    totalChunks,
+  };
+  const cache = new IdbCacheAdapter(idb, cacheMeta);
+  const reader: ChunkReader = {
+    size: sizeOf,
+    read: (index) =>
+      file.slice(index * chunkSize, index * chunkSize + sizeOf(index)).arrayBuffer(),
+  };
 
-    const init = await initFile({
+  try {
+    /* ---------- 0) 本地全量哈希缓存：直接带清单 init（可能零哈希秒传） ---------- */
+    const prefix = await cache.loadPrefix();
+    const fullyCached = totalChunks > 0 && prefix.cursor >= totalChunks;
+    const cachedHashes = fullyCached ? prefix.hashes : null;
+
+    const init0 = await initFile({
       fileId,
       fileName: file.name,
       fileSize: file.size,
       chunkSize,
       totalChunks,
-      fileHash,
+      fileHash: cachedHashes ? await aggregateHash(cachedHashes) : null,
+      chunkHashes: cachedHashes,
     });
+
+    if (init0.instant) {
+      log(`⚡ 秒传命中（完整清单），零上传，复用合并产物：${init0.file.mergedHash}`);
+      progress.phase = 'instant-done';
+      progress.hashedChunks = totalChunks;
+      progress.hashCacheReused = totalChunks;
+      progress.settledChunks = totalChunks;
+      progress.settledBytes = file.size;
+      progress.serverSkippedChunks = totalChunks;
+      emit();
+      await idb.clear(fileId).catch(() => {});
+      return {
+        instant: true,
+        init: init0,
+        complete: null,
+        serverSkippedChunks: totalChunks,
+        globalDedupChunks: 0,
+        hashCacheReused: totalChunks,
+        newlyUploadedChunks: 0,
+      };
+    }
+
+    if (cachedHashes) {
+      log(
+        `本地已有全量哈希：本任务已有 ${init0.uploadedChunks.length} 片，` +
+          `全局 CAS 命中 ${Object.keys(init0.hits).length} 片，仅上传缺失分片`,
+      );
+    } else if (init0.resumed) {
+      log(`检测到历史任务，本任务已存在 ${init0.uploadedChunks.length} 片`);
+    } else {
+      log('已注册分阶段任务（边算边传，聚合哈希算完补报/仲裁秒传）');
+    }
+
+    // 本任务关联 + 初始全局 CAS 命中
+    const known = new Map<number, string>();
+    for (const c of init0.uploadedChunks) known.set(c.index, c.hash);
+    const skipHashes = new Set<string>(Object.values(init0.hits ?? {}));
+
+    const uploadStart = performance.now();
+    const remote: RemoteChunks = {
+      known,
+      skipHashes,
+      upload: (index, hash, buffer) =>
+        withRetry(
+          () =>
+            uploadChunk({
+              fileId,
+              index,
+              hash,
+              blob: new Blob([buffer]),
+              signal,
+            }),
+          signal,
+        ).then((r) => {
+          if (r.dedup) log(`分片 #${index} 命中全局 CAS 去重（物理只存一份）`);
+          return undefined;
+        }),
+    };
+
+    progress.phase = 'pipeline';
+    emit();
+
+    /* ---------- 1) 有界流水线；全哈希就绪时做秒传/去重仲裁 ---------- */
+    const result = await runPipeline({
+      totalChunks,
+      hasher: worker,
+      reader,
+      cache,
+      remote,
+      maxInflight,
+      uploadConcurrency,
+      signal,
+      events: {
+        onAllHashed: async (allHashes) => {
+          const fileHash = await aggregateHash(allHashes);
+          const reInit = await initFile({
+            fileId,
+            fileName: file.name,
+            fileSize: file.size,
+            chunkSize,
+            totalChunks,
+            fileHash,
+            chunkHashes: allHashes,
+          });
+          if (reInit.instant) {
+            log('⚡ 全量哈希算出后秒传命中，中止剩余上传');
+            progress.phase = 'instant-done';
+            emit();
+            return 'instant';
+          }
+          let added = 0;
+          for (const h of Object.values(reInit.hits ?? {})) {
+            if (!skipHashes.has(h)) {
+              skipHashes.add(h);
+              added += 1;
+            }
+          }
+          if (added > 0) log(`哈希算齐复核：新增 ${added} 个全局 CAS 命中分片`);
+        },
+        onTick: (c) => {
+          progress.hashing = c.hashing > 0;
+          progress.uploading = c.uploading > 0;
+          progress.queuedChunks = c.queued;
+          progress.inflightChunks = c.inflight;
+          progress.hashedChunks = c.hashedChunks;
+          progress.hashCacheReused = c.hashCacheReused;
+          progress.settledChunks = c.settledChunks;
+          progress.serverSkippedChunks = c.serverSkipped;
+          progress.globalDedupChunks = c.globalDedupSkipped;
+          progress.newlyUploadedChunks = c.newlyUploaded;
+          // 落位字节用计数器按片近似（精确字节在结束时统一结算）
+          progress.settledBytes = 0;
+          let settledBytes = 0;
+          for (let i = 0; i < c.settledChunks && i < totalChunks; i++) {
+            settledBytes += sizeOf(Math.min(i, totalChunks - 1));
+          }
+          progress.settledBytes = Math.min(settledBytes, file.size);
+          emit();
+        },
+        onUploadDone: (info) => {
+          if (!info.skippedOnServer) {
+            progress.newlyUploadedBytes += info.size;
+            const elapsedSec = (performance.now() - uploadStart) / 1000;
+            progress.bytesPerSec =
+              elapsedSec > 0 ? progress.newlyUploadedBytes / elapsedSec : 0;
+          }
+        },
+      },
+    });
+
+    // 结算落位字节（按最终哈希与已知集合判定每片归属）
+    let settledBytes = 0;
+    for (let i = 0; i < totalChunks; i++) settledBytes += sizeOf(i);
+    progress.settledBytes = settledBytes;
+    emit();
+
+    /* ---------- 2) 秒传仲裁命中：服务端已 completed ---------- */
+    if (result.instantAborted) {
+      const fileHash = await aggregateHash(result.chunkHashes);
+      const initFinal = await initFile({
+        fileId,
+        fileName: file.name,
+        fileSize: file.size,
+        chunkSize,
+        totalChunks,
+        fileHash,
+        chunkHashes: result.chunkHashes,
+      });
+      log(`秒传完成，复用合并产物：${initFinal.file.mergedHash}`);
+      await idb.clear(fileId).catch(() => {});
+      return {
+        instant: true,
+        init: initFinal,
+        complete: null,
+        serverSkippedChunks: result.counters.serverSkipped,
+        globalDedupChunks: result.counters.globalDedupSkipped,
+        hashCacheReused: result.counters.hashCacheReused,
+        newlyUploadedChunks: result.counters.newlyUploaded,
+      };
+    }
+
     log(
-      init.resumed
-        ? `检测到历史任务，服务端已存在 ${init.uploadedChunks.length} 个分片`
-        : '新任务已在服务端注册',
+      `流水线完成：复用本地哈希 ${result.counters.hashCacheReused} 片，` +
+        `本任务跳过 ${result.counters.serverSkipped} 片，` +
+        `全局 CAS 命中 ${result.counters.globalDedupSkipped} 片，` +
+        `本次新传 ${result.counters.newlyUploaded} 片`,
     );
 
-    const uploadedByIndex = new Map<number, string>();
-    for (const c of init.uploadedChunks) uploadedByIndex.set(c.index, c.hash);
-
-    /* 序号 + 哈希同时命中才算已上传（内容变化会被识别为需要重传） */
-    const pendingIndexes: number[] = [];
-    for (let i = 0; i < totalChunks; i++) {
-      if (uploadedByIndex.get(i) === chunkHashes[i]) {
-        progress.skippedChunks += 1;
-        progress.settledChunks += 1;
-        progress.settledBytes += chunkLength(file.size, chunkSize, i);
-      } else {
-        pendingIndexes.push(i);
-      }
-    }
-    log(`断点续传跳过 ${progress.skippedChunks} 片，待上传 ${pendingIndexes.length} 片`);
+    /* ---------- 3) 补报锁定聚合哈希 → 服务端强校验 + 合并 ---------- */
+    progress.phase = 'locking-hash';
     emit();
+    const fileHash = await aggregateHash(result.chunkHashes);
+    const hashResp = await submitFileHash(fileId, fileHash);
+    log(
+      hashResp.changed
+        ? `聚合哈希已补报锁定：${fileHash}`
+        : `聚合哈希一致（幂等）：${fileHash}`,
+    );
 
-    /* 阶段 3：有界并发上传缺失分片（二进制 body） */
-    progress.phase = 'uploading';
-    emit();
-    const uploadStart = performance.now();
-
-    await runPool(pendingIndexes, concurrency, signal, async (index) => {
-      const size = chunkLength(file.size, chunkSize, index);
-      const blob = file.slice(index * chunkSize, index * chunkSize + size);
-      await withRetry(
-        () =>
-          uploadChunk({
-            fileId,
-            index,
-            hash: chunkHashes[index],
-            blob,
-            signal,
-          }),
-        signal,
-      );
-      progress.newlyUploadedBytes += size;
-      progress.settledBytes += size;
-      progress.settledChunks += 1;
-      const elapsedSec = (performance.now() - uploadStart) / 1000;
-      progress.bytesPerSec =
-        elapsedSec > 0 ? progress.newlyUploadedBytes / elapsedSec : 0;
-      emit();
-    });
-
-    /* 阶段 4：服务端全量重算 + 聚合校验 + 合并 */
     progress.phase = 'completing';
     emit();
-    log('全部分片已就位，请求服务端聚合校验并合并…');
     const complete = await completeFile(fileId);
-    log(`服务端校验通过，完整文件 SHA-256：${complete.mergedHash}`);
-
+    log(`服务端强校验通过，完整文件 SHA-256：${complete.mergedHash}`);
     progress.phase = 'done';
     emit();
 
-    return { init, complete, skippedChunks: progress.skippedChunks };
+    await idb.clear(fileId).catch(() => {});
+
+    return {
+      instant: false,
+      init: init0,
+      complete,
+      serverSkippedChunks: result.counters.serverSkipped,
+      globalDedupChunks: result.counters.globalDedupSkipped,
+      hashCacheReused: result.counters.hashCacheReused,
+      newlyUploadedChunks: result.counters.newlyUploaded,
+    };
   } finally {
     worker.terminate();
+    await idb.close().catch(() => {});
   }
 }

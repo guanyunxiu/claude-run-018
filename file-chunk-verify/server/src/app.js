@@ -5,6 +5,7 @@
 import express from 'express';
 import cors from 'cors';
 import filesRouter from './routes/files.js';
+import adminRouter from './routes/admin.js';
 import { config } from './config.js';
 
 export function createApp() {
@@ -19,7 +20,9 @@ export function createApp() {
 
   // JSON 接口（分片上传路由自带 raw parser，不受影响）
   app.use('/api/files/init', express.json({ limit: '1mb' }));
+  app.use('/api/files/precheck', express.json({ limit: '1mb' }));
   app.use('/api/files', filesRouter);
+  app.use('/api/admin', adminRouter);
 
   // 404
   app.use((_req, res) => {

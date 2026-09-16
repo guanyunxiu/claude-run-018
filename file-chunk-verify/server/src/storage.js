@@ -1,7 +1,9 @@
 /**
- * 本地磁盘存储：
- *  - 分片：storage/chunks/<fileId>/<index 补零 8 位>.part（tmp + rename 原子写入）
- *  - 合并文件：storage/merged/<fileId>__<原文件名>（流式顺序追加 + 流式哈希）
+ * 内容寻址（CAS）本地磁盘存储：
+ *   分片：storage/cas/<hash 前2位>/<chunkHash>.part        —— 同内容全局只存一份
+ *   合并：storage/merged/<hash 前2位>/<mergedHash>.bin     —— 秒传可共享
+ *
+ * 物理文件均为 tmp + rename 原子写入；路径由哈希推导，天然防目录穿越。
  */
 import fs from 'node:fs';
 import fsp from 'node:fs/promises';
@@ -9,92 +11,116 @@ import path from 'node:path';
 import { createHash } from 'node:crypto';
 import { config } from './config.js';
 
-const CHUNK_DIR = path.join(config.storageDir, 'chunks');
+const CAS_DIR = path.join(config.storageDir, 'cas');
 const MERGED_DIR = path.join(config.storageDir, 'merged');
 
-/** 防止路径穿越：fileId 只允许 hex */
-export function safeFileId(fileId) {
-  if (!/^[a-f0-9]{64}$/i.test(fileId)) {
-    const err = new Error('非法文件ID');
+const HASH_RE = /^[a-f0-9]{64}$/i;
+
+/** 校验 hex 哈希，防止路径穿越；统一小写 */
+export function safeHash(hash, label = 'hash') {
+  if (typeof hash !== 'string' || !HASH_RE.test(hash)) {
+    const err = new Error(`非法${label}`);
     err.code = 'VALIDATION_ERROR';
     err.status = 400;
     throw err;
   }
-  return fileId.toLowerCase();
+  return hash.toLowerCase();
 }
 
-/** 去除文件名中的路径分隔等危险字符，仅保留基础名 */
+/** fileId 也是 64 位 hex（用于兼容旧接口入参校验） */
+export function safeFileId(fileId) {
+  return safeHash(fileId, '文件ID');
+}
+
+/** 去除文件名中的路径分隔等危险字符 */
 export function safeBaseName(name) {
   return path.basename(name).replace(/[\\/\0]+/g, '_');
 }
 
-function chunkDir(fileId) {
-  return path.join(CHUNK_DIR, safeFileId(fileId));
+/* ---------------- CAS 分片 ---------------- */
+
+/** CAS 分片相对路径：cas/<前2>/<hash>.part */
+export function casChunkRelPath(chunkHash) {
+  const h = safeHash(chunkHash, '分片哈希');
+  return path.join('cas', h.slice(0, 2), `${h}.part`).split(path.sep).join('/');
 }
 
-export function chunkRelPath(fileId, index) {
-  return path
-    .join('chunks', safeFileId(fileId), `${String(index).padStart(8, '0')}.part`)
-    .split(path.sep)
-    .join('/');
+function casChunkAbsPath(chunkHash) {
+  return path.join(config.storageDir, casChunkRelPath(chunkHash));
 }
 
-function chunkAbsPath(fileId, index) {
-  return path.join(config.storageDir, chunkRelPath(fileId, index));
+export function casChunkExists(chunkHash) {
+  return fs.existsSync(casChunkAbsPath(safeHash(chunkHash)));
 }
 
-export function mergedRelPath(fileId, originalName) {
-  return path
-    .join('merged', `${safeFileId(fileId)}__${safeBaseName(originalName)}`)
-    .split(path.sep)
-    .join('/');
-}
-
-/**
- * 原子写入分片：先写 .tmp，fsync 后 rename，避免半截分片被读取。
- */
-export async function writeChunk(fileId, index, buffer) {
-  const dir = chunkDir(fileId);
-  await fsp.mkdir(dir, { recursive: true });
-  const target = chunkAbsPath(fileId, index);
-  const tmp = `${target}.${process.pid}.${Date.now()}.tmp`;
+/** 原子写入一个 CAS 分片（tmp + rename；同名文件已存在则保留） */
+export async function writeCasChunk(chunkHash, buffer) {
+  const h = safeHash(chunkHash, '分片哈希');
+  const abs = casChunkAbsPath(h);
+  await fsp.mkdir(path.dirname(abs), { recursive: true });
+  // 并发首传：临时名带 pid/随机串，互不覆盖；rename 到同目标由 FS 保证原子
+  const tmp = `${abs}.${process.pid}.${Math.random().toString(36).slice(2, 8)}.tmp`;
   await fsp.writeFile(tmp, buffer);
-  await fsp.rename(tmp, target);
-  return chunkRelPath(fileId, index);
+  await fsp.rename(tmp, abs);
+  return casChunkRelPath(h);
 }
 
-export function chunkExists(fileId, index) {
-  return fs.existsSync(chunkAbsPath(fileId, index));
+/** 删除一个 CAS 物理分片（GC / 引用归零时） */
+export async function removeCasChunk(chunkHash) {
+  const abs = casChunkAbsPath(safeHash(chunkHash));
+  await fsp.rm(abs, { force: true });
+}
+
+/** 读取 CAS 分片字节（complete 重算/抽检） */
+export function readCasChunk(chunkHash) {
+  return fsp.readFile(casChunkAbsPath(safeHash(chunkHash)));
+}
+
+/* ---------------- 内容寻址合并产物 ---------------- */
+
+export function mergedBlobRelPath(mergedHash) {
+  const h = safeHash(mergedHash, '合并哈希');
+  return path.join('merged', h.slice(0, 2), `${h}.bin`).split(path.sep).join('/');
+}
+
+function mergedBlobAbsPath(mergedHash) {
+  return path.join(config.storageDir, mergedBlobRelPath(mergedHash));
+}
+
+export function mergedBlobExists(mergedHash) {
+  return fs.existsSync(mergedBlobAbsPath(safeHash(mergedHash)));
 }
 
 /**
- * 按序号顺序流式合并分片，同时计算完整文件 sha256。
- * @returns {Promise<{mergedAbsolutePath:string, mergedHash:string}>}
+ * 按序流式读取 CAS 分片合并，同时计算完整文件 sha256。
+ * @returns {Promise<{relPath:string, absPath:string, mergedHash:string, totalBytes:number}>}
  */
-export async function mergeChunks(fileId, chunkCount, originalName) {
-  const id = safeFileId(fileId);
-  await fsp.mkdir(MERGED_DIR, { recursive: true });
-  const rel = mergedRelPath(id, originalName);
-  const abs = path.join(config.storageDir, rel);
-  const tmp = `${abs}.${process.pid}.${Date.now()}.tmp`;
+export async function mergeCasChunks(orderedChunkHashes, expectedMergedHash = null) {
+  if (orderedChunkHashes.length === 0) {
+    // 空文件：写一个 0 字节内容寻址文件
+    const emptyHash = createHash('sha256').digest('hex');
+    return writeMergedBlob(emptyHash, Buffer.alloc(0));
+  }
 
   const hash = createHash('sha256');
-  const out = fs.createWriteStream(tmp);
-
-  /** 等待可写流排空（背压），保证 GB 文件低内存 */
-  const writeAsync = (chunk) =>
+  const tmpOut = path.join(
+    await fsp.mkdtemp(path.join(config.storageDir, 'merge-')),
+    'out.tmp',
+  );
+  const out = fs.createWriteStream(tmpOut);
+  const writeAsync = (data) =>
     new Promise((resolve, reject) => {
-      if (out.write(chunk)) return resolve();
+      if (out.write(data)) return resolve();
       out.once('drain', resolve);
       out.once('error', reject);
     });
 
+  let totalBytes = 0;
   try {
-    let totalBytes = 0;
-    for (let i = 0; i < chunkCount; i += 1) {
-      const part = chunkAbsPath(id, i);
-      // 64KB 高水位读取，内存占用恒定
-      const input = fs.createReadStream(part, { highWaterMark: 64 * 1024 });
+    for (const ch of orderedChunkHashes) {
+      const input = fs.createReadStream(casChunkAbsPath(ch), {
+        highWaterMark: 64 * 1024,
+      });
       for await (const piece of input) {
         hash.update(piece);
         totalBytes += piece.length;
@@ -106,17 +132,63 @@ export async function mergeChunks(fileId, chunkCount, originalName) {
       out.once('error', reject);
       out.end();
     });
-    await fsp.rename(tmp, abs);
-    return { mergedAbsolutePath: abs, mergedHash: hash.digest('hex'), totalBytes };
-  } catch (err) {
+    const mergedHash = hash.digest('hex');
+    if (expectedMergedHash && expectedMergedHash !== mergedHash) {
+      throw Object.assign(new Error('合并产物哈希与预期不符'), {
+        code: 'MERGED_HASH_MISMATCH',
+      });
+    }
+    const result = await installMergedBlob(mergedHash, tmpOut);
+    return { ...result, totalBytes };
+  } finally {
     out.destroy();
-    await fsp.rm(tmp, { force: true });
-    throw err;
+    await fsp.rm(tmpOut, { force: true }).catch(() => {});
+    await fsp.rm(path.dirname(tmpOut), { recursive: true, force: true }).catch(() => {});
   }
+}
+
+async function writeMergedBlob(mergedHash, buffer) {
+  const h = safeHash(mergedHash, '合并哈希');
+  const rel = mergedBlobRelPath(h);
+  const abs = path.join(config.storageDir, rel);
+  await fsp.mkdir(path.dirname(abs), { recursive: true });
+  if (!fs.existsSync(abs)) {
+    const tmp = `${abs}.${process.pid}.${Date.now()}.tmp`;
+    await fsp.writeFile(tmp, buffer);
+    await fsp.rename(tmp, abs);
+  }
+  return { relPath: rel, absPath: abs, mergedHash: h };
+}
+
+/** 把已写好的合并临时文件原子安装到内容寻址路径（已存在则复用） */
+async function installMergedBlob(mergedHash, tmpAbs) {
+  const rel = mergedBlobRelPath(mergedHash);
+  const abs = path.join(config.storageDir, rel);
+  await fsp.mkdir(path.dirname(abs), { recursive: true });
+  if (fs.existsSync(abs)) {
+    await fsp.rm(tmpAbs, { force: true });
+  } else {
+    await fsp.rename(tmpAbs, abs);
+  }
+  return { relPath: rel, absPath: abs, mergedHash: safeHash(mergedHash) };
+}
+
+export async function removeMergedBlob(mergedHash) {
+  const abs = mergedBlobAbsPath(safeHash(mergedHash));
+  await fsp.rm(abs, { force: true });
+}
+
+/** 供下载/校验流式读取合并产物 */
+export function createMergedReadStream(mergedHash) {
+  return fs.createReadStream(mergedBlobAbsPath(safeHash(mergedHash)));
+}
+
+export function mergedBlobAbs(mergedHash) {
+  return mergedBlobAbsPath(safeHash(mergedHash));
 }
 
 /** 初始化存储目录 */
 export async function ensureStorageDirs() {
-  await fsp.mkdir(CHUNK_DIR, { recursive: true });
+  await fsp.mkdir(CAS_DIR, { recursive: true });
   await fsp.mkdir(MERGED_DIR, { recursive: true });
 }
