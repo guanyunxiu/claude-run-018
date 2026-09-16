@@ -1,0 +1,70 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>GB 级文件分布式分片校验系统</title>
+  </head>
+  <body>
+    <main class="container">
+      <h1>GB 级文件分片上传 · 断点续传 · 聚合校验</h1>
+      <p class="sub">
+        单 WebWorker 计算 SHA-256 ｜ Web Crypto ｜ Fetch 上传 ｜
+        服务端落盘前校验 + 完成时全量重算
+      </p>
+
+      <section class="card">
+        <div class="row">
+          <label class="file-picker">
+            <input id="fileInput" type="file" />
+            <span>选择本地大文件</span>
+          </label>
+        </div>
+
+        <div class="row meta" id="fileMeta">尚未选择文件</div>
+
+        <div class="row controls">
+          <label>
+            分片大小：
+            <select id="chunkSizeSelect">
+              <option value="2097152">2 MB</option>
+              <option value="4194304">4 MB</option>
+              <option value="8388608" selected>8 MB</option>
+              <option value="16777216">16 MB</option>
+            </select>
+          </label>
+          <button id="startBtn" class="primary" disabled>开始分片与上传</button>
+          <button id="cancelBtn" disabled>取消</button>
+        </div>
+
+        <div class="progress-block">
+          <div class="phase-label">
+            <span id="hashPhase">① 分片哈希（Worker）</span>
+          </div>
+          <div class="bar"><div id="hashBar" class="fill hash"></div></div>
+          <div class="phase-label">
+            <span id="upPhase">② 分片上传（3 并发）</span>
+          </div>
+          <div class="bar"><div id="upBar" class="fill up"></div></div>
+        </div>
+
+        <div class="stats">
+          <div id="hashText">哈希进度：-</div>
+          <div id="upText">上传进度：-</div>
+        </div>
+
+        <pre id="log" class="log" aria-live="polite"></pre>
+
+        <div id="result" class="result hidden">
+          <h3>✅ 服务端聚合校验通过，文件已合并</h3>
+          <div>文件 ID：<code id="rFileId"></code></div>
+          <div>分片数：<code id="rChunks"></code></div>
+          <div>聚合哈希（分片哈希链）：<code id="rAgg"></code></div>
+          <div>完整文件 SHA-256：<code id="rMerged"></code></div>
+          <div>服务端存储路径：<code id="rPath"></code></div>
+        </div>
+      </section>
+    </main>
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>

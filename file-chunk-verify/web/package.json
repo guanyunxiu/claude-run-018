@@ -1,0 +1,17 @@
+{
+  "name": "file-chunk-verify-web",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc -p tsconfig.json --noEmit && tsc -p tsconfig.worker.json --noEmit && vite build",
+    "preview": "vite preview"
+  },
+  "dependencies": {
+    "vite": "^5.4.11"
+  },
+  "devDependencies": {
+    "typescript": "^5.7.2"
+  }
+}

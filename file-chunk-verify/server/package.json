@@ -1,0 +1,21 @@
+{
+  "name": "file-chunk-verify-server",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "GB 级文件分片上传与聚合校验后端（Express + MySQL + 本地磁盘）",
+  "main": "src/server.js",
+  "scripts": {
+    "start": "node src/server.js",
+    "dev": "node --watch src/server.js",
+    "test:e2e": "node --no-warnings --loader ./test/mock-mysql-loader.mjs test/e2e.mjs"
+  },
+  "dependencies": {
+    "cors": "^2.8.5",
+    "express": "^4.21.2",
+    "mysql2": "^3.11.5"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}
