@@ -85,6 +85,27 @@ async function ensureSchema(pool) {
       KEY idx_ref_count (ref_count)
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
   `);
+
+  // ---- 增量迁移（旧库升级，CREATE TABLE IF NOT EXISTS 不会改既有列） ----
+  // 迭代二起 file_hash 允许为 NULL（分阶段任务：init 时无聚合哈希，/hash 后补报）。
+  // 旧 schema 为 NOT NULL，真 MySQL 下分阶段 init 会直接 ER_BAD_NULL_ERROR(500)。
+  await migrateNullableColumn(pool, 'files', 'file_hash', 'CHAR(64) NULL');
+}
+
+/**
+ * 幂等列迁移：仅当列的 IS_NULLABLE=NO 时才 ALTER。
+ * information_schema 查询在内存 mock 中同样实现，保证测试与真库语义一致。
+ */
+async function migrateNullableColumn(pool, table, column, targetDef) {
+  const [cols] = await pool.query(
+    `SELECT IS_NULLABLE AS isNullable
+       FROM information_schema.COLUMNS
+      WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ? AND COLUMN_NAME = ?`,
+    [config.db.database, table, column],
+  );
+  if (cols.length > 0 && cols[0].isNullable === 'NO') {
+    await pool.query(`ALTER TABLE \`${table}\` MODIFY \`${column}\` ${targetDef}`);
+  }
 }
 
 let pool;

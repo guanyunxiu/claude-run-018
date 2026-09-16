@@ -4,6 +4,10 @@
 --   - file_chunks : files ↔ cas_chunks 的多对多关联（每文件每序号一条）
 --   - merged_blobs: 合并产物同样内容寻址 + 引用计数（秒传可零拷贝共享）
 -- 后端启动时会自动执行等效 CREATE TABLE，本文件用于手动初始化。
+--
+-- 旧库升级（v1/v2 的 files.file_hash 为 NOT NULL，会让分阶段 init(fileHash=null)
+-- 在真 MySQL 上 ER_BAD_NULL_ERROR）。后端启动时按 information_schema 幂等执行一次：
+--   ALTER TABLE files MODIFY file_hash CHAR(64) NULL;
 -- ============================================================
 
 CREATE TABLE IF NOT EXISTS files (

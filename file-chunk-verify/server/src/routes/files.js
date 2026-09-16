@@ -24,6 +24,7 @@ import {
   writeCasChunk,
   readCasChunk,
   casChunkRelPath,
+  casChunkPhysicalOk,
   mergeCasChunks,
   createMergedReadStream,
   mergedBlobAbs,
@@ -100,6 +101,9 @@ function parseManifest(body, totalChunks) {
 /**
  * 查找一个可用的秒捐文件：同聚合哈希、已完成、合并产物与全部分片物理可读。
  * 必须在事务内调用（FOR UPDATE 锁定候选行）。
+ *
+ * 不再 LIMIT 1：最新捐赠者可能是脏数据（合并产物/分片物理缺失、关联不齐），
+ * 必须取全部候选按 updated_at 倒序逐个校验，跳过损坏者直到找到完好者。
  * @returns 捐赠文件行，或 null
  */
 async function findUsableDonor(conn, fileHash, expectedChunkHashes) {
@@ -107,60 +111,55 @@ async function findUsableDonor(conn, fileHash, expectedChunkHashes) {
     `SELECT id, file_name, file_size, merged_hash, merged_path, total_chunks
        FROM files
       WHERE file_hash = ? AND status = 'completed' AND merged_hash IS NOT NULL
-      ORDER BY updated_at DESC
-      LIMIT 1
+      ORDER BY updated_at DESC, created_at DESC
        FOR UPDATE`,
     [fileHash],
   );
   for (const donor of donors) {
-    // 合并产物元数据与物理文件都在
-    const [mb] = await conn.query(
-      'SELECT merged_hash, storage_path FROM merged_blobs WHERE merged_hash = ? FOR UPDATE',
-      [donor.merged_hash],
-    );
-    if (mb.length === 0) continue;
-    try {
-      await fsp.access(path.join(config.storageDir, mb[0].storage_path));
-    } catch {
-      continue;
-    }
-
-    // 分片关联齐全且物理可读；若给了清单则逐片哈希必须一致
-    const [links] = await conn.query(
-      `SELECT fc.chunk_index, fc.chunk_hash, cc.storage_path
-         FROM file_chunks fc
-         JOIN cas_chunks cc ON cc.chunk_hash = fc.chunk_hash
-        WHERE fc.file_id = ?
-        ORDER BY fc.chunk_index FOR UPDATE`,
-      [donor.id],
-    );
-    if (links.length !== donor.total_chunks) continue;
-    let usable = true;
-    for (let i = 0; i < links.length; i += 1) {
-      const link = links[i];
-      if (link.chunk_index !== i) {
-        usable = false;
-        break;
-      }
-      if (expectedChunkHashes && expectedChunkHashes[i] !== link.chunk_hash) {
-        usable = false;
-        break;
-      }
-      // 抽检物理可读（秒传也要防止元数据指向空文件）
-      try {
-        const st = await fsp.stat(path.join(config.storageDir, link.storage_path));
-        if (st.size === 0 && donor.file_size !== '0') {
-          usable = false;
-          break;
-        }
-      } catch {
-        usable = false;
-        break;
-      }
-    }
-    if (usable) return donor;
+    if (await isDonorUsable(conn, donor, expectedChunkHashes)) return donor;
   }
   return null;
+}
+
+/** 校验单个候选捐赠者：合并产物可读 + 分片关联齐全 + 逐片哈希一致 + 物理可读 */
+async function isDonorUsable(conn, donor, expectedChunkHashes) {
+  // 合并产物元数据与物理文件都在
+  const [mb] = await conn.query(
+    'SELECT merged_hash, storage_path FROM merged_blobs WHERE merged_hash = ? FOR UPDATE',
+    [donor.merged_hash],
+  );
+  if (mb.length === 0) return false;
+  try {
+    const st = await fsp.stat(path.join(config.storageDir, mb[0].storage_path));
+    if (BigInt(st.size) !== BigInt(donor.file_size)) return false;
+  } catch {
+    return false;
+  }
+
+  // 分片关联齐全且物理可读；若给了清单则逐片哈希必须一致
+  const [links] = await conn.query(
+    `SELECT fc.chunk_index, fc.chunk_hash, cc.chunk_size, cc.storage_path
+       FROM file_chunks fc
+       JOIN cas_chunks cc ON cc.chunk_hash = fc.chunk_hash
+      WHERE fc.file_id = ?
+      ORDER BY fc.chunk_index FOR UPDATE`,
+    [donor.id],
+  );
+  if (links.length !== donor.total_chunks) return false;
+  for (let i = 0; i < links.length; i += 1) {
+    const link = links[i];
+    if (link.chunk_index !== i) return false;
+    if (expectedChunkHashes && expectedChunkHashes[i] !== link.chunk_hash) return false;
+    // 逐片物理可读（秒传也要防止元数据指向空文件/损坏文件）
+    try {
+      const st = await fsp.stat(path.join(config.storageDir, link.storage_path));
+      if (BigInt(st.size) !== BigInt(link.chunk_size)) return false;
+      if (st.size === 0 && donor.file_size !== '0') return false;
+    } catch {
+      return false;
+    }
+  }
+  return true;
 }
 
 /**
@@ -686,17 +685,32 @@ router.post(
         [fileId, index],
       );
 
-      // CAS 全局分片：锁行，存在则引用 +1（本次引用先加上，旧关联稍后回收）
+      // CAS 全局分片：锁行。存在时必须确认物理可读，否则用本次请求体重写（自愈幽灵片）。
       const [casRows] = await conn.query(
         'SELECT * FROM cas_chunks WHERE chunk_hash = ? FOR UPDATE',
         [expectedHash],
       );
       let casExisted = casRows.length > 0;
+      let healed = false;
       if (casExisted) {
-        await conn.query(
-          'UPDATE cas_chunks SET ref_count = ref_count + 1 WHERE chunk_hash = ?',
-          [expectedHash],
-        );
+        // 库行存在 ≠ 物理文件健康：GC 中途崩溃/磁盘位翻转可能造成“有行无 .part”。
+        const physicalOk = await casChunkPhysicalOk(expectedHash, casRows[0].chunk_size);
+        if (physicalOk) {
+          await conn.query(
+            'UPDATE cas_chunks SET ref_count = ref_count + 1 WHERE chunk_hash = ?',
+            [expectedHash],
+          );
+        } else {
+          // 自愈：用本次上传的字节原子重写物理文件，再补计数（行可能 ref_count=0）
+          await writeCasChunk(expectedHash, body);
+          healed = true;
+          await conn.query(
+            `UPDATE cas_chunks
+                SET chunk_size = ?, storage_path = ?, ref_count = ref_count + 1
+              WHERE chunk_hash = ?`,
+            [body.length, casChunkRelPath(expectedHash), expectedHash],
+          );
+        }
       } else {
         // 全局首传：先原子落盘（哈希已在上方校验），再插入元数据。
         // 并发首传时唯一键可能冲突——交由唯一键兜底，catch 后走“已存在”分支。
@@ -711,8 +725,16 @@ router.post(
         } catch (insErr) {
           if (insErr.code === 'ER_DUP_ENTRY') {
             casExisted = true;
-            // 另一个请求已插入（物理也已原子安装）；ref_count 已被对方置 1，
-            // 本请求仍需占 1 个引用
+            // 并发下另一个请求已建行；同样要先验盘（防共享幽灵行），缺失则重写
+            const [rival] = await conn.query(
+              'SELECT chunk_size FROM cas_chunks WHERE chunk_hash = ? FOR UPDATE',
+              [expectedHash],
+            );
+            if (!(await casChunkPhysicalOk(expectedHash, rival[0]?.chunk_size))) {
+              await writeCasChunk(expectedHash, body);
+              healed = true;
+            }
+            // ref_count 已被对方置 1，本请求仍需占 1 个引用
             await conn.query(
               'UPDATE cas_chunks SET ref_count = ref_count + 1 WHERE chunk_hash = ?',
               [expectedHash],
@@ -759,7 +781,8 @@ router.post(
         hash: expectedHash,
         size: body.length,
         skipped,
-        dedup: casExisted,
+        dedup: casExisted && !healed,
+        healed,
       });
     } catch (err) {
       await conn.rollback();

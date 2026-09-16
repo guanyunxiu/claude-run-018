@@ -288,24 +288,41 @@ console.log('T5：取消后再开——缓存与服务端清单分别续算、�
   const reader = makeReader(total, () => CHUNK);
   const allHashes = reader.bufs.map((b) => sha256(b));
   const cache = makeCache();
-  // 让上传变慢，确保取消发生在中途
-  const remote = makeRemote([], { uploadDelay: 15 });
+  // 哈希慢于上传：取消时保证既有已传片、也有未传片
+  const remote = makeRemote([], { uploadDelay: 2 });
 
   const ac = new AbortController();
   let rejected = false;
+  // 确定性取消：哈希慢(12ms)、上传快(2ms)；当已有 ≥2 片上传完成且哈希到第 4 片时 abort，
+  // 保证取消时“本地已落部分哈希、服务端已收部分分片、且两者都未全部完成”。
+  let hashedCount = 0;
+  const slowHasher = {
+    async hash(index, buffer) {
+      await new Promise((r) => setTimeout(r, 12));
+      return sha256(buffer);
+    },
+  };
   const run1 = runPipeline({
     totalChunks: total,
-    hasher: makeHasher(),
+    hasher: slowHasher,
     reader,
     cache,
     remote,
     maxInflight: 4,
     uploadConcurrency: 2,
     signal: ac.signal,
+    events: {
+      onUploadDone() {
+        if (!ac.signal.aborted && hashedCount >= 4 && remote.uploaded.size >= 2) {
+          ac.abort();
+        }
+      },
+      onHashDone(_info, fromCache) {
+        if (!fromCache) hashedCount += 1;
+      },
+    },
   });
 
-  // 40ms 后取消：此时已持久化一部分哈希、上传完成一部分分片
-  setTimeout(() => ac.abort(), 40);
   try {
     await run1;
   } catch (err) {
@@ -447,51 +464,73 @@ console.log('T9：部分分片哈希在全局 CAS 已存在 → link 只关联�
   check('新传计数为 6', res.counters.newlyUploaded === 6);
 }
 
-/* ---------------- T10 全哈希就绪 → 秒传中止 ---------------- */
-console.log('T10：onAllHashed 仲裁秒传后，剩余分片不再上传');
+/* ---------------- T10 全哈希就绪 → 秒传中止（确定性门控，避免时序抖动） ---------------- */
+console.log('T10：onAllHashed 仲裁秒传后，尚未发起的排队项全部中止');
 {
   const total = 20;
   const reader = makeReader(total, () => CHUNK);
   const allHashes = reader.bufs.map((b) => sha256(b));
-  // 哈希极快(1ms)、上传较慢(30ms)、HTTP 并发仅 2；槽位放宽到 ≥总数，
-  // 模拟“哈希远快于网络”：算完时大部分片还在排队，秒传仲裁应丢弃这些排队项
-  const remote = makeRemote([], { uploadDelay: 30 });
-  const fastHasher = {
-    calls: 0,
-    async hash(index, buffer) {
-      this.calls += 1;
-      await new Promise((r) => setTimeout(r, 1));
-      return sha256(buffer);
+
+  // 确定性：上传在“放行门”打开前一律挂起。先让 2 个上传在途（并发=2），
+  // 其余 18 个停在排队；此时触发秒传，排队项必须全部被丢弃。
+  let gateOpen = false;
+  const waiters = [];
+  let started = 0;
+  const remote = {
+    known: new Map(),
+    skipHashes: new Set(),
+    uploaded: new Map(),
+    async upload(i, h, buf) {
+      assert.equal(sha256(buf), h);
+      started += 1;
+      if (gateOpen) {
+        this.uploaded.set(i, h);
+        return;
+      }
+      await new Promise((r) => waiters.push(r));
+      this.uploaded.set(i, h);
     },
+    async link() {},
   };
 
-  // 当全部哈希就绪时返回 instant（模拟带清单 init 命中已完成文件）
+  let resolveHashes;
+  const allHashed = new Promise((r) => { resolveHashes = r; });
   let hookHashes = null;
-  const res = await runPipeline({
+  const runP = runPipeline({
     totalChunks: total,
-    hasher: fastHasher,
+    hasher: { async hash(i, b) { return sha256(b); } }, // 哈希同步完成
     reader,
     cache: makeCache(),
     remote,
-    maxInflight: 20,
+    maxInflight: total,
     uploadConcurrency: 2,
     events: {
       onAllHashed(hashes) {
         hookHashes = hashes;
+        // 秒传仲裁：立即放行在途 upload（模拟它们收到 FILE_ALREADY_VERIFIED/完成），
+        // 但队列里剩余项必须被丢弃、不再补发
+        gateOpen = true;
+        waiters.forEach((r) => r());
+        resolveHashes();
         return 'instant';
       },
     },
   });
 
+  // 等待全部哈希完成
+  await allHashed;
   check('钩子收到完整且正确的 20 个哈希',
     hookHashes && hookHashes.length === 20 &&
     hookHashes.every((h, i) => h === allHashes[i]));
+  check('仲裁触发时只有并发数个上传在途（其余排队）', started <= 2);
+
+  const res = await runP;
   check('返回 instantAborted=true', res.instantAborted === true);
   check('全部 20 片完成哈希', res.counters.hashedChunks === 20);
-  // 仲裁时最多 2 个在途请求 + 极少数边界（信号切换瞬间），排队项必须被丢弃
-  check('秒传中止后排队项被丢弃，新传 ≤ 在途并发+边界(4)',
-    res.counters.newlyUploaded <= 4);
-  check('绝大多数分片未上传（至少 15 片被秒传省去）', remote.uploaded.size <= 4);
+
+  await new Promise((r) => setTimeout(r, 5));
+  check('秒传中止后排队项被丢弃（最终发起上传数 ≤ 并发 2）', started <= 2);
+  check('至少 18 个排队分片被秒传省去', total - started >= 18);
 }
 
 /* ---------------- T11 缓存前缀 + 全局命中：不读字节不哈希，但必须 link ---------------- */
@@ -598,6 +637,79 @@ console.log('T13：init.uploadedChunks 已有的片即使 hash 也在全局集�
   check('本任务跳过计数=1，全局关联计数=1',
     res.counters.serverSkipped === 1 && res.counters.globalDedupSkipped === 1);
   check('4 片全 settled', res.counters.settledChunks === 4);
+}
+
+/* ---------------- T14 link 发现幽灵片时回退字节上传（自愈） ---------------- */
+console.log('T14：全局命中片 /link 返回 CHUNK_FILE_MISSING 时，自动回退字节上传');
+{
+  const total = 4;
+  const reader = makeReader(total, () => CHUNK);
+  const allHashes = reader.bufs.map((b) => sha256(b));
+  // #1 在 skipHashes 中，但服务端 link 报“物理缺失”（GC 幽灵行）
+  const remote = {
+    known: new Map(),
+    skipHashes: new Set([allHashes[1]]),
+    uploaded: new Map(),
+    linked: new Map(),
+    async upload(i, h, buf) {
+      assert.equal(sha256(buf), h);
+      this.uploaded.set(i, h);
+    },
+    async link(i) {
+      const e = new Error('CHUNK_FILE_MISSING');
+      e.code = 'CHUNK_FILE_MISSING';
+      throw e;
+    },
+  };
+
+  const res = await runPipeline({
+    totalChunks: total,
+    hasher: makeHasher(),
+    reader,
+    cache: makeCache(),
+    remote,
+    maxInflight: 6,
+    uploadConcurrency: 2,
+  });
+
+  check('#1 回退为字节上传（heal）', remote.uploaded.has(1));
+  check('#1 未被错误计为 link 成功', !remote.linked.has(1));
+  check('#1 计入新传', res.counters.newlyUploaded >= 1);
+  check('4 片全 settled', res.counters.settledChunks === 4);
+}
+
+/* ---------------- T15 link 报其它错误仍正常冒泡 ---------------- */
+console.log('T15：link 报非幽灵错误（如 500）时整个流水线失败');
+{
+  const total = 2;
+  const reader = makeReader(total, () => CHUNK);
+  const allHashes = reader.bufs.map((b) => sha256(b));
+  const remote = {
+    known: new Map(),
+    skipHashes: new Set([allHashes[0]]),
+    uploaded: new Map(),
+    async upload() {},
+    async link() {
+      const e = new Error('boom');
+      e.code = 'INTERNAL_ERROR';
+      throw e;
+    },
+  };
+  let threw = null;
+  try {
+    await runPipeline({
+      totalChunks: total,
+      hasher: makeHasher(),
+      reader,
+      cache: makeCache(),
+      remote,
+      maxInflight: 6,
+      uploadConcurrency: 2,
+    });
+  } catch (e) {
+    threw = e;
+  }
+  check('非幽灵 link 错误被冒泡', threw && threw.message === 'boom');
 }
 
 console.log(`\n流水线全部 ${passed} 条断言通过 ✅`);

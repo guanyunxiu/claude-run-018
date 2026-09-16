@@ -49,17 +49,24 @@ merged_blobs     合并产物：merged_hash(PK), file_size, storage_path, ref_co
 引用计数规则：
 
 - 一个 `file_chunks` 行 = 对一个 `cas_chunks` 的 1 个引用（同文件内不同序号即使哈希相同也各计 1）。
-- 上传分片（`POST /chunks/:i`）：CAS 已存在则 `ref_count+1`；同文件同序号同哈希重传为幂等
-  （撤销多加的计数）；同序号不同内容则替换关联、旧哈希 `ref_count-1`。
+- 上传分片（`POST /chunks/:i`）：CAS 行已存在时**先确认物理文件存在且大小一致**，
+  通过才 `ref_count+1`；若发现“有库行、无 `.part`”的幽灵片（旧版 GC 中途崩溃遗留），
+  用本次请求的字节**原子重写物理片**再关联（响应 `healed:true`），不会带着悬空引用继续。
+  同文件同序号同哈希重传为幂等（撤销多加的计数）；同序号不同内容则替换关联、旧哈希 `ref_count-1`。
 - **只关联（`POST /chunks/:i/link?hash=`，无请求体）**：当 `init.hits` 表明某片的物理内容已在
   全局 CAS 中存在时，前端**不发送字节**，改调 `/link` 建立本文件的 `file_chunks` 关联并
   `ref_count+1`。注意：“CAS 里有物理片” ≠ “本 fileId 已有关联”，**绝不能因为命中 hits 就裸
-  跳过**，否则 `complete` 会 `CHUNKS_INCOMPLETE`。
+  跳过**，否则 `complete` 会 `CHUNKS_INCOMPLETE`。`/link` 同样验盘，物理缺失时返回
+  `CHUNK_FILE_MISSING`，前端据此**回退为带字节上传**自愈。
 - 秒传：复用捐赠文件的全部分片与合并产物；关联建立是**幂等**的——对目标文件已存在的同序号同哈希
   关联（边算边传时在途上传所建）不重复 `ref_count+1`，仅补齐缺失序号，杜绝引用虚高。
 - 删除文件：逐关联 `ref_count-1`、删关联行、删 files 行、合并产物 `ref_count-1`，**不删物理文件**。
-- GC：`POST /api/admin/gc` 回收 `ref_count=0` 且创建超过 `minAgeSec`（默认 300s）的物理对象，
-  避免与“先写元数据后建关联”的正常首传竞争。
+- GC（**三阶段、可恢复、幂等**，`POST /api/admin/gc`）：
+  1. **事务内只删库行**（`ref_count=0` 且超过 `minAgeSec`，默认 300s，`FOR UPDATE SKIP LOCKED`），
+     先提交；不再“事务内先删物理文件”，杜绝回滚后留下「有行无文件」。
+  2. **提交后删物理文件**：删盘失败不回滚库一致性，下次 GC 兜底。
+  3. **磁盘对账**：删除“库中已无任何行”的物理孤儿（同样受 mtime 宽限保护，避免误删
+     正在原子安装的首传分片）。任意阶段中断后重跑都收敛到一致状态。
 
 ### 秒传 / 只关联时序
 
@@ -81,6 +88,14 @@ merged_blobs     合并产物：merged_hash(PK), file_size, storage_path, ref_co
 文件即把任务置为 `completed`；仍在途的上传/关联请求可能收到 `FILE_ALREADY_VERIFIED`，
 前端会**忽略该错误**（该文件已由秒传幂等补齐），不让整次上传失败；服务端秒传关联对这些在途片
 幂等，因此删除后引用能精确归零、GC 可彻底回收（有“先传若干片再秒传”的专门测试）。
+
+捐赠者选择：服务端取出**全部**同聚合哈希的已完成候选（不再 `LIMIT 1`），按新旧倒序
+**逐个**校验合并产物可读、分片关联齐全、逐片物理可读且大小一致，跳过任何损坏候选直到找到
+完好者；全部损坏则不秒传（可走字节上传自愈）。测试模拟“最新捐赠者关联不完整、更老者完好”。
+
+旧库迁移：`files.file_hash` 自迭代二起允许 NULL。后端启动时查 `information_schema`，
+若旧库该列仍为 `NOT NULL` 则幂等执行 `ALTER TABLE files MODIFY file_hash CHAR(64) NULL`，
+保证真 MySQL 上分阶段 `init(fileHash=null)` 不再 `ER_BAD_NULL_ERROR`（`npm run test:migrate`）。
 
 ### 与前两轮的关系
 
@@ -123,17 +138,22 @@ merged_blobs     合并产物：merged_hash(PK), file_size, storage_path, ref_co
 
 ```bash
 cd server
-npm run test:e2e       # 103 条：秒传、跨文件去重、删 A 不影响 B complete/下载、引用归零 GC、
+npm run test:e2e       # 115 条：秒传、跨文件去重、删 A 不影响 B、引用归零 GC、
                        #   并发同 hash 首传幂等、篡改共享分片检出、
                        #   hits 命中片必须 /link 否则 CHUNKS_INCOMPLETE、
-                       #   先传若干片再秒传的引用计数精确性（GC 必须能全部回收）
+                       #   先传若干片再秒传的引用精确性、
+                       #   GC 幽灵片（有行无文件）字节上传自愈 + GC 幂等、
+                       #   多捐赠者中跳过关联不完整的最新候选选中完好者
+npm run test:migrate   # 旧库 file_hash NOT NULL → 启动迁移变 NULLABLE（恰好一次 ALTER、
+                       #   幂等、历史数据保留），迁移后分阶段 init(fileHash=null) 主路径可用
 npm run smoke:staged   # 分阶段边传边补哈希 + 强校验（40MB）
 npm run smoke:cas      # 25 项真实 HTTP：A 正常→B 秒传零上传→C 用 link 只关联命中片+传差异片
                        #   →无视 hits 裸跳过被 CHUNKS_INCOMPLETE 拦截→删除→GC 物理回收
 
 cd ../web
-npm run test:pipeline  # 63 条：边算边传、有界槽位、续算续传、全局命中走 link（非裸跳过）、
-                       #   秒传仲裁中止排队项、在途请求收 FILE_ALREADY_VERIFIED 被忽略、本任务关联优先
+npm run test:pipeline  # 69 条：边算边传、有界槽位、续算续传、全局命中走 link（非裸跳过）、
+                       #   秒传仲裁确定性中止排队项、在途请求收 FILE_ALREADY_VERIFIED 被忽略、
+                       #   link 发现幽灵片回退字节上传自愈、本任务关联优先
 npm run smoke:resume   # 4GB/512 片中途刷新的复用与有界内存
 ```
 

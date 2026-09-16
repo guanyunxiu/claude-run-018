@@ -902,5 +902,117 @@ console.log('场景 16：秒传仲裁竞态：在途片已建关联，秒传不�
   }
 }
 
+/* ---------- 场景 17：GC 幽灵分片自愈 + GC 可重入/可恢复 ---------- */
+console.log('场景 17：GC 留下「有行无文件」幽灵片时，去重上传自愈；GC 重复执行幂等');
+{
+  const parts = [Buffer.from('ghost-001!'), Buffer.from('ghost-002!'), Buffer.from('ghost-003!')]; // 10B
+  const content = Buffer.concat(parts);
+  const hashes = parts.map(sha256);
+  const agg = sha256Text(hashes.join(''));
+  const idA = sha256Text(`ghostA:${content.length}:1700000008001:10`);
+
+  // 文件 A 正常上传完成（物理片齐全）
+  await call('POST', '/init', JSON.stringify({
+    fileId: idA, fileName: 'ghostA.bin', fileSize: content.length, chunkSize: 10,
+    totalChunks: 3, fileHash: agg,
+  }), { 'Content-Type': 'application/json' });
+  for (let i = 0; i < 3; i++) {
+    await call('POST', `/${idA}/chunks/${i}?hash=${hashes[i]}`, parts[i]);
+  }
+  await call('POST', `/${idA}/complete`);
+
+  // 模拟“旧 GC 先删物理后回滚”：手工删掉 #1 的物理文件，但保留 cas_chunks 行
+  const ghostRel = `cas/${hashes[1].slice(0, 2)}/${hashes[1]}.part`;
+  await fsp.rm(path.join(process.env.STORAGE_DIR, ghostRel), { force: true });
+
+  // 此刻文件 A 的 complete 已完成（状态 completed），不影响；
+  // 关键：文件 B 去重重传 #1 时，库行存在但物理缺失，必须自愈重写而不是只 +ref
+  const idB = sha256Text(`ghostB:${content.length}:1700000008002:10`);
+  await call('POST', '/init', JSON.stringify({
+    fileId: idB, fileName: 'ghostB.bin', fileSize: content.length, chunkSize: 10,
+    totalChunks: 3, fileHash: agg, chunkHashes: hashes,
+  }), { 'Content-Type': 'application/json' });
+
+  // /link 对幽灵片应失败（只关联无法自愈，因为没有字节）→ CAS_CHUNK_NOT_FOUND
+  const linkGhost = await call('POST', `/${idB}/chunks/1/link?hash=${hashes[1]}`);
+  check('link 物理缺失的幽灵片被拒绝（不建立悬空关联）',
+    linkGhost.status === 409 &&
+    (linkGhost.json.error.code === 'CHUNK_FILE_MISSING' || linkGhost.json.error.code === 'CAS_CHUNK_NOT_FOUND'));
+
+  // 带字节上传：库行存在但物理缺失 → 自愈重写，响应 healed=true
+  const healUp = await call('POST', `/${idB}/chunks/1?hash=${hashes[1]}`, parts[1]);
+  check('去重上传命中幽灵行时自愈重写（healed=true，201）',
+    healUp.status === 201 && healUp.json.healed === true);
+  check('物理文件已被重写', await fsp.access(path.join(process.env.STORAGE_DIR, ghostRel)).then(() => true).catch(() => false));
+
+  // 其余两片 link（物理健康），B complete 成功——证明自愈后内容可读、强校验通过
+  await call('POST', `/${idB}/chunks/0/link?hash=${hashes[0]}`);
+  await call('POST', `/${idB}/chunks/2/link?hash=${hashes[2]}`);
+  const bDone = await call('POST', `/${idB}/complete`);
+  check('自愈后 B complete 成功（不再 CHUNK_FILE_MISSING）', bDone.status === 200);
+  const dlB = await fetch(`http://localhost:${port}/api/files/${idB}/download`);
+  check('自愈后 B 下载字节正确',
+    Buffer.compare(Buffer.from(await dlB.arrayBuffer()), content) === 0);
+
+  // GC 幂等：连续执行两次不应报错、不应误删被引用片
+  const gc1 = await gcCall(0);
+  check('被引用期间第一次 GC 删除 0 库行', gc1.json.removedChunks === 0);
+  const gc2 = await gcCall(0);
+  check('GC 重复执行幂等（仍删除 0，无报错）', gc2.json.removedChunks === 0);
+  check('B 仍可下载',
+    (await fetch(`http://localhost:${port}/api/files/${idB}/download`)).status === 200);
+}
+
+/* ---------- 场景 18：多个捐赠者中跳过损坏者，选中更老的完好捐赠者 ---------- */
+console.log('场景 18：最新捐赠者关联不完整时，秒传逐个校验后选中更老的完好捐赠者');
+{
+  const { __mockDb } = await import('./mock-mysql.mjs');
+  const parts = [Buffer.from('donorA-001'), Buffer.from('donorA-002')]; // 10B x2
+  const content = Buffer.concat(parts);
+  const hashes = parts.map(sha256);
+  const agg = sha256Text(hashes.join(''));
+
+  // 老捐赠者 OLD：完整上传
+  const idOld = sha256Text(`donorOld:${content.length}:1700000009001:10`);
+  await call('POST', '/init', JSON.stringify({
+    fileId: idOld, fileName: 'old.bin', fileSize: content.length, chunkSize: 10,
+    totalChunks: 2, fileHash: agg,
+  }), { 'Content-Type': 'application/json' });
+  for (let i = 0; i < 2; i++) {
+    await call('POST', `/${idOld}/chunks/${i}?hash=${hashes[i]}`, parts[i]);
+  }
+  await call('POST', `/${idOld}/complete`);
+
+  // 新捐赠者 NEW：先正常秒传（updated_at 更新、排在候选首位）
+  const idNew = sha256Text(`donorNew:${content.length}:1700000009002:10`);
+  const newInit = await call('POST', '/init', JSON.stringify({
+    fileId: idNew, fileName: 'new.bin', fileSize: content.length, chunkSize: 10,
+    totalChunks: 2, fileHash: agg, chunkHashes: hashes,
+  }), { 'Content-Type': 'application/json' });
+  check('NEW 首次秒传成功', newInit.json.instant === true);
+
+  // 制造脏数据：删掉 NEW 的一个 file_chunks 关联（关联不完整），
+  // 并把其 updated_at 推后，保证它在候选顺序中排第一。物理 CAS 仍完好（OLD 可用）。
+  const mdb = __mockDb();
+  mdb.fileChunks = mdb.fileChunks.filter(
+    (l) => !(l.file_id === idNew && l.chunk_index === 1),
+  );
+  mdb.files.get(idNew).updated_at = new Date(Date.now() + 60_000);
+
+  // 第三个文件：候选顺序 [NEW(脏), OLD(完好)]，必须跳过 NEW 选中 OLD
+  const idInst = sha256Text(`instant18:${content.length}:1700000009003:10`);
+  const instInit = await call('POST', '/init', JSON.stringify({
+    fileId: idInst, fileName: 'inst.bin', fileSize: content.length, chunkSize: 10,
+    totalChunks: 2, fileHash: agg, chunkHashes: hashes,
+  }), { 'Content-Type': 'application/json' });
+  check('最新捐赠者关联不完整时仍秒传（跳过脏候选、选中完好的 OLD）',
+    instInit.json.instant === true);
+  check('秒传建立完整 2 片关联', instInit.json.uploadedChunks.length === 2);
+  const dl = await fetch(`http://localhost:${port}/api/files/${idInst}/download`);
+  check('秒传文件可下载且字节正确',
+    dl.status === 200 &&
+    Buffer.compare(Buffer.from(await dl.arrayBuffer()), content) === 0);
+}
+
 server.close();
 console.log(`\n全部 ${passed} 条断言通过 ✅`);

@@ -76,6 +76,22 @@ export function readCasChunk(chunkHash) {
   return fsp.readFile(casChunkAbsPath(safeHash(chunkHash)));
 }
 
+/**
+ * 校验某个 CAS 物理分片存在且字节数与记录一致。
+ * 用于「库行存在但磁盘可能缺失」的自愈判断（GC 崩溃后、去重命中时）。
+ */
+export async function casChunkPhysicalOk(chunkHash, expectedSize) {
+  try {
+    const st = await fsp.stat(casChunkAbsPath(safeHash(chunkHash)));
+    if (expectedSize !== undefined && BigInt(st.size) !== BigInt(expectedSize)) {
+      return false;
+    }
+    return st.size >= 0;
+  } catch {
+    return false;
+  }
+}
+
 /* ---------------- 内容寻址合并产物 ---------------- */
 
 export function mergedBlobRelPath(mergedHash) {
@@ -191,4 +207,88 @@ export function mergedBlobAbs(mergedHash) {
 export async function ensureStorageDirs() {
   await fsp.mkdir(CAS_DIR, { recursive: true });
   await fsp.mkdir(MERGED_DIR, { recursive: true });
+}
+
+/* ---------------- 磁盘对账（GC 崩溃恢复用） ---------------- */
+
+async function listFilesRecursive(root) {
+  let entries;
+  try {
+    entries = await fsp.readdir(root, { withFileTypes: true });
+  } catch {
+    return [];
+  }
+  const out = [];
+  for (const e of entries) {
+    const abs = path.join(root, e.name);
+    if (e.isDirectory()) {
+      out.push(...(await listFilesRecursive(abs)));
+    } else if (e.isFile()) {
+      out.push(abs);
+    }
+  }
+  return out;
+}
+
+/** 列出磁盘上全部 CAS 分片：{hash, abs, mtimeMs}，忽略 .tmp 等临时文件 */
+async function listPhysicalCasFiles() {
+  const out = [];
+  for (const abs of await listFilesRecursive(CAS_DIR)) {
+    const m = /^([a-f0-9]{64})\.part$/.exec(path.basename(abs));
+    if (!m) continue;
+    let mtimeMs = 0;
+    try {
+      mtimeMs = (await fsp.stat(abs)).mtimeMs;
+    } catch {
+      continue;
+    }
+    out.push({ hash: m[1], abs, mtimeMs });
+  }
+  return out;
+}
+
+/** 列出磁盘上全部合并产物：{hash, abs, mtimeMs} */
+async function listPhysicalMergedFiles() {
+  const out = [];
+  for (const abs of await listFilesRecursive(MERGED_DIR)) {
+    const m = /^([a-f0-9]{64})\.bin$/.exec(path.basename(abs));
+    if (!m) continue;
+    let mtimeMs = 0;
+    try {
+      mtimeMs = (await fsp.stat(abs)).mtimeMs;
+    } catch {
+      continue;
+    }
+    out.push({ hash: m[1], abs, mtimeMs });
+  }
+  return out;
+}
+
+/** 兼容旧调用 */
+export async function listPhysicalCasHashes() {
+  return (await listPhysicalCasFiles()).map((f) => f.hash);
+}
+export async function listPhysicalMergedHashes() {
+  return (await listPhysicalMergedFiles()).map((f) => f.hash);
+}
+
+/**
+ * 删除“库里没有对应行”的物理孤儿文件（GC 提交后、删盘前崩溃的残留）。
+ * 仅删除 mtime 早于 cutoff 的文件，避免误删“物理已原子安装、DB 行尚未提交”
+ * 的首传分片；tmp 文件不在内容寻址命名内，天然不会被扫到。
+ * @returns 实际删除的文件数
+ */
+export async function sweepOrphanPhysical(existingHashes, kind, cutoff = null) {
+  const known = new Set(existingHashes.map((h) => safeHash(h)));
+  const files =
+    kind === 'cas' ? await listPhysicalCasFiles() : await listPhysicalMergedFiles();
+  let removed = 0;
+  for (const f of files) {
+    if (known.has(f.hash)) continue;
+    if (cutoff && f.mtimeMs >= cutoff.getTime()) continue; // 太新，可能正在首传
+    if (kind === 'cas') await removeCasChunk(f.hash);
+    else await removeMergedBlob(f.hash);
+    removed += 1;
+  }
+  return removed;
 }

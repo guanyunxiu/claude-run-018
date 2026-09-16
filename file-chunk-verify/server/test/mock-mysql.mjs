@@ -8,6 +8,20 @@ const db = {
   cas: new Map(), // chunk_hash -> row
   fileChunks: [], // {id, file_id, chunk_index, chunk_hash, status}
   merged: new Map(), // merged_hash -> row
+  // 列可空性元数据，模拟 information_schema（旧库 files.file_hash 为 NOT NULL）
+  columns: {
+    files: {
+      // 默认新库为可空（与 CREATE TABLE 一致）；旧库迁移测试置 MOCK_LEGACY_NOTNULL=1
+      file_hash: { isNullable: process.env.MOCK_LEGACY_NOTNULL === '1' ? 'NO' : 'YES' },
+    },
+  },
+  // 记录迁移动作（测试断言“旧库启动时确实执行了 ALTER”）
+  alterLog: [],
+};
+
+// 测试辅助：模拟旧库（file_hash NOT NULL）
+globalThis.__mockSetFileHashNullable = (nullable) => {
+  db.columns.files.file_hash.isNullable = nullable ? 'YES' : 'NO';
 };
 
 let fcAuto = 0;
@@ -67,13 +81,68 @@ async function runQuery(rawSql, params) {
 
   if (/^CREATE\b/i.test(n)) return [[]];
 
+  /* ---- information_schema：列可空性（迁移幂等判断） ---- */
+  if (n.includes('FROM information_schema.COLUMNS') && n.includes('IS_NULLABLE')) {
+    // 生产代码用 3 个 ?（schema,table,column）；测试可能用字面量 table/column。
+    let tableName = params[1];
+    let columnName = params[2];
+    if (params.length < 3) {
+      const tm = n.match(/TABLE_NAME\s*=\s*'(\w+)'/);
+      const cm = n.match(/COLUMN_NAME\s*=\s*'(\w+)'/);
+      tableName = tm?.[1];
+      columnName = cm?.[1];
+    }
+    const col = db.columns[tableName]?.[columnName];
+    if (col) return [[{ isNullable: col.isNullable, n: col.isNullable }]];
+    return [[]];
+  }
+
+  /* ---- ALTER TABLE ... MODIFY ... NULL：执行迁移、更新元数据 ---- */
+  if (/^ALTER TABLE/i.test(n)) {
+    const mm = /TABLE `?(\w+)`? MODIFY `?(\w+)`? (.*)$/i.exec(n);
+    if (mm) {
+      const [, table, column, def] = mm;
+      db.columns[table] ||= {};
+      const nullable = /\bNULL\b/i.test(def) && !/NOT NULL/i.test(def);
+      db.columns[table][column] = { isNullable: nullable ? 'YES' : 'NO' };
+      db.alterLog.push({ table, column, def: def.trim() });
+    }
+    return [{ affectedRows: 0, info: 'mock alter' }];
+  }
+
   /* ---------------- files ---------------- */
 
   if (n.startsWith('INSERT INTO files')) {
     m = n.match(
       /VALUES \('([^']*)', '((?:[^']|'')*)', '(\d+)', (\d+), (\d+), (?:('([a-f0-9]{64})')|NULL), '(\w+)'\)/,
     );
-    if (!m) throw new Error('mock INSERT files: ' + n);
+    if (!m) {
+      // 兼容带列名清单的参数化 INSERT：直接从 params 构造（值已 bind 进 SQL 时）
+      const mm = n.match(
+        /INSERT INTO files \(([^)]+)\)\s*VALUES \((.*)\)$/s,
+      );
+      if (mm) {
+        const cols = mm[1].split(',').map((s) => s.trim());
+        const vals = mm[2].split(',').map((s) => s.trim());
+        const row = {
+          merged_hash: null,
+          merged_path: null,
+          created_at: new Date(),
+          updated_at: new Date(),
+        };
+        cols.forEach((c, i) => {
+          let v = vals[i];
+          if (v === 'NULL') v = null;
+          else if (/^'.*'$/.test(v)) v = v.slice(1, -1).replace(/''/g, "'");
+          else if (/^\d+$/.test(v)) v = /size|chunks/.test(c) && c !== 'chunk_size' ? v : Number(v);
+          row[c] = v;
+        });
+        if (typeof row.file_size === 'number') row.file_size = String(row.file_size);
+        db.files.set(row.id, row);
+        return [{ affectedRows: 1 }];
+      }
+      throw new Error('mock INSERT files: ' + n);
+    }
     db.files.set(m[1], {
       id: m[1],
       file_name: m[2].replace(/''/g, "'"),
@@ -93,6 +162,19 @@ async function runQuery(rawSql, params) {
   if ((m = n.match(/^SELECT \* FROM files WHERE id = '([^']+)' FOR UPDATE$/))) {
     const row = db.files.get(m[1]);
     return [row ? [{ ...row }] : []];
+  }
+  if ((m = n.match(/^SELECT (?!\*)(.*?) FROM files WHERE id = \?$/))) {
+    // 参数化查询：WHERE id = ?（bind 后通常为字面量，此分支兜底）
+    const row = db.files.get(String(params[0]));
+    if (!row) return [[]];
+    const cols = m[1].split(',').map((s) => s.trim());
+    return [[Object.fromEntries(cols.map((c) => [c, row[c]]))]];
+  }
+  if ((m = n.match(/^SELECT (?!\*)(.*?) FROM files WHERE id = '([^']+)'$/))) {
+    const row = db.files.get(m[2]);
+    if (!row) return [[]];
+    const cols = m[1].split(',').map((s) => s.trim());
+    return [[Object.fromEntries(cols.map((c) => [c, row[c]]))]];
   }
   if ((m = n.match(/^SELECT \* FROM files WHERE id = '([^']+)'$/))) {
     const row = db.files.get(m[1]);
@@ -198,6 +280,11 @@ async function runQuery(rawSql, params) {
     const row = db.cas.get(m[1]);
     return [row ? [{ ...row }] : []];
   }
+  if (n.startsWith('SELECT chunk_size FROM cas_chunks WHERE chunk_hash')) {
+    m = n.match(/chunk_hash = '([a-f0-9]{64})'/);
+    const row = db.cas.get(m[1]);
+    return [row ? [{ chunk_size: row.chunk_size }] : []];
+  }
 
   if (n.startsWith('INSERT INTO cas_chunks')) {
     m = n.match(
@@ -226,6 +313,20 @@ async function runQuery(rawSql, params) {
   ) {
     const row = db.cas.get(m[1]);
     if (row) row.ref_count += 1;
+    return [{ affectedRows: row ? 1 : 0 }];
+  }
+  if (
+    (m = n.match(
+      /^UPDATE cas_chunks SET chunk_size = (\d+), storage_path = '([^']+)', ref_count = ref_count \+ 1 WHERE chunk_hash = '([a-f0-9]{64})'$/,
+    ))
+  ) {
+    // 上传自愈：物理缺失后重写，更新大小/路径并 +1 引用
+    const row = db.cas.get(m[3]);
+    if (row) {
+      row.chunk_size = BigInt(num(m[1]));
+      row.storage_path = m[2];
+      row.ref_count += 1;
+    }
     return [{ affectedRows: row ? 1 : 0 }];
   }
   if (
@@ -321,7 +422,12 @@ async function runQuery(rawSql, params) {
       'SELECT merged_hash, file_size, storage_path FROM merged_blobs WHERE ref_count = 0',
     )
   ) {
-    return [[...db.merged.values()].filter((x) => x.ref_count === 0).map((x) => ({ ...x }))];
+    const cutoff = params[0] instanceof Date ? params[0] : new Date(Date.now() - 300 * 1000);
+    return [
+      [...db.merged.values()]
+        .filter((x) => x.ref_count === 0 && x.created_at < cutoff)
+        .map((x) => ({ ...x })),
+    ];
   }
   if ((m = n.match(/^DELETE FROM merged_blobs WHERE merged_hash = '([a-f0-9]{64})' AND ref_count = 0$/))) {
     const row = db.merged.get(m[1]);
@@ -429,6 +535,14 @@ async function runQuery(rawSql, params) {
     return [[{ c: db.fileChunks.filter((l) => l.file_id === m[1]).length }]];
   }
 
+  // GC 阶段 C 全表对账
+  if (n === 'SELECT chunk_hash FROM cas_chunks') {
+    return [[...db.cas.keys()].map((h) => ({ chunk_hash: h }))];
+  }
+  if (n === 'SELECT merged_hash FROM merged_blobs') {
+    return [[...db.merged.keys()].map((h) => ({ merged_hash: h }))];
+  }
+
   throw new Error('mock-mysql 未实现的 SQL: ' + n);
 }
 
@@ -445,6 +559,11 @@ export function createPool() {
       return new Connection();
     },
   };
+}
+
+/** 测试钩子：直接访问内存库（仅用于构造真实接口难以制造的脏数据） */
+export function __mockDb() {
+  return db;
 }
 
 export default { createConnection, createPool };

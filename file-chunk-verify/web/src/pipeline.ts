@@ -421,6 +421,7 @@ export async function runPipeline(opts: PipelineOptions): Promise<PipelineResult
 
       const { index, hash, buffer, linkOnly } = item;
       const size = linkOnly ? reader.size(index) : (buffer as ArrayBuffer).byteLength;
+      let wasLinkOnly = linkOnly;
       try {
         counters.uploading += 1;
         events?.onUploadStart?.(index, false);
@@ -435,17 +436,23 @@ export async function runPipeline(opts: PipelineOptions): Promise<PipelineResult
             counters.newlyUploaded += 1;
           }
         } catch (err) {
-          // 秒传仲裁竞态：在途请求到达时任务已被带清单 init 置为 completed，
-          // 服务端返回 FILE_ALREADY_VERIFIED —— 此时整文件已由秒传关联完成，
-          // 在途的这一片“失败”不应让整次上传失败。
-          if (
-            instantAborted &&
-            typeof err === 'object' &&
-            err !== null &&
-            'code' in err &&
-            (err as { code?: string }).code === 'FILE_ALREADY_VERIFIED'
-          ) {
+          const code =
+            typeof err === 'object' && err !== null && 'code' in err
+              ? (err as { code?: string }).code
+              : undefined;
+          // 秒传仲裁竞态：在途请求到达时任务已被置 completed
+          if (instantAborted && code === 'FILE_ALREADY_VERIFIED') {
             counters.globalDedupSkipped += linkOnly ? 1 : 0;
+          } else if (
+            // /link 发现 CAS 物理缺失（GC 幽灵行）：回退为带字节上传，
+            // 服务端会用请求体重写物理片（healed），本文件关联也随之建立。
+            linkOnly &&
+            (code === 'CAS_CHUNK_NOT_FOUND' || code === 'CHUNK_FILE_MISSING')
+          ) {
+            const healBuffer = await reader.read(index);
+            await remote.upload(index, hash, healBuffer);
+            wasLinkOnly = false;
+            counters.newlyUploaded += 1;
           } else {
             throw err;
           }
@@ -455,11 +462,11 @@ export async function runPipeline(opts: PipelineOptions): Promise<PipelineResult
         events?.onUploadDone?.({
           index,
           size,
-          skippedOnServer: linkOnly,
+          skippedOnServer: wasLinkOnly,
         });
       } finally {
-        // 只有真正持有字节的上传项占过内存槽；link 项不占
-        if (!linkOnly) {
+        // 只有真正持有字节（上传/自愈回退）的项占过内存槽；纯 link 项不占
+        if (!wasLinkOnly) {
           counters.inflight -= 1;
           slots.release();
         }
