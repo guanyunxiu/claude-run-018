@@ -154,3 +154,30 @@ export async function completeFile(fileId: string): Promise<CompleteResponse> {
   if (!res.ok) throw await parseError(res);
   return (await res.json()) as CompleteResponse;
 }
+
+export interface LinkChunkResponse {
+  index: number;
+  hash: string;
+  size: number;
+  skipped: boolean;
+  linked: true;
+}
+
+/**
+ * 只关联一片已存在的全局 CAS 分片（不发送分片字节）。
+ * 用于 init.hits 命中：物理片已在服务端，但本文件需要自己的 file_chunks 关联，
+ * 否则 complete 会 CHUNKS_INCOMPLETE。
+ */
+export async function linkChunk(
+  fileId: string,
+  index: number,
+  hash: string,
+  signal?: AbortSignal,
+): Promise<LinkChunkResponse> {
+  const res = await fetch(`${BASE}/${fileId}/chunks/${index}/link?hash=${hash}`, {
+    method: 'POST',
+    signal,
+  });
+  if (!res.ok) throw await parseError(res);
+  return (await res.json()) as LinkChunkResponse;
+}

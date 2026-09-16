@@ -81,15 +81,21 @@ function cache() {
 function remote(knownEntries = []) {
   const known = new Map(knownEntries);
   const uploaded = new Map();
+  const linked = new Map();
   return {
     known,
     skipHashes: new Set(),
     uploaded,
+    linked,
     uploads: 0,
     async upload(i, h) {
       this.uploads += 1;
       await new Promise((r) => setImmediate(r));
       uploaded.set(i, h);
+    },
+    async link(i, h) {
+      await new Promise((r) => setImmediate(r));
+      linked.set(i, h);
     },
   };
 }

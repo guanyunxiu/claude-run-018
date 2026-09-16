@@ -91,21 +91,28 @@ const cInit = await r.json();
 ok(cInit.instant === false, 'C 内容不同不秒传');
 ok(cInit.hits['0'] === hashes[0] && cInit.hits['2'] === hashes[2], 'init.hits 标出全局已存在的 #0/#2');
 
-// 即使客户端无视 hits 仍上传，服务端返回 dedup=true 且物理只一份
-const up0 = await fetch(`${base}/${idC}/chunks/0?hash=${hashesC[0]}`, {
-  method: 'POST', headers: { 'Content-Type': 'application/octet-stream' }, body: partsC[0],
-});
-ok((await up0.json()).dedup === true, 'C 上传共享片返回 dedup=true');
+// 反向验证：若客户端无视 hits、一片都不关联/上传就 complete，必然缺片
+const idLazy = fid('lazy.bin', contentC.length, cs);
+await fetch(`${base}/init`, J({
+  fileId: idLazy, fileName: 'lazy.bin', fileSize: contentC.length, chunkSize: cs,
+  totalChunks: 3, fileHash: aggC, chunkHashes: hashesC,
+}));
+const lazyDone = await fetch(`${base}/${idLazy}/complete`, { method: 'POST' });
+ok(lazyDone.status === 409 && (await lazyDone.json()).error.code === 'CHUNKS_INCOMPLETE',
+  '无视 hits 裸跳过 → complete 报 CHUNKS_INCOMPLETE');
+await fetch(`${base}/${idLazy}`, { method: 'DELETE' }); // 清理该任务
+
+// 正确做法：#0/#2 是全局命中 → 只关联不传字节；#1 是差异片 → 上传字节
+const lk0 = await fetch(`${base}/${idC}/chunks/0/link?hash=${hashesC[0]}`, { method: 'POST' });
+ok((await lk0.json()).linked === true, 'C 的 #0 只关联（零字节）');
 const up1 = await fetch(`${base}/${idC}/chunks/1?hash=${hashesC[1]}`, {
   method: 'POST', headers: { 'Content-Type': 'application/octet-stream' }, body: partsC[1],
 });
-ok((await up1.json()).dedup === false, 'C 的差异片 dedup=false');
-const up2 = await fetch(`${base}/${idC}/chunks/2?hash=${hashesC[2]}`, {
-  method: 'POST', headers: { 'Content-Type': 'application/octet-stream' }, body: partsC[2],
-});
-ok((await up2.json()).dedup === true, 'C 上传 #2 共享片 dedup=true');
+ok((await up1.json()).dedup === false, 'C 的差异片 #1 上传 dedup=false');
+const lk2 = await fetch(`${base}/${idC}/chunks/2/link?hash=${hashesC[2]}`, { method: 'POST' });
+ok((await lk2.json()).linked === true, 'C 的 #2 只关联（零字节）');
 r = await fetch(`${base}/${idC}/complete`, { method: 'POST' });
-ok(r.status === 200, 'C complete 成功');
+ok(r.status === 200, 'C 关联命中片 + 上传差异片后 complete 成功');
 
 // 物理共享分片路径唯一
 const sharedAbs = path.join(process.env.STORAGE_DIR, 'cas', hashes[0].slice(0, 2), `${hashes[0]}.part`);

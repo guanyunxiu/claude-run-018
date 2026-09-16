@@ -164,8 +164,13 @@ async function findUsableDonor(conn, fileHash, expectedChunkHashes) {
 }
 
 /**
- * 在事务内建立秒传关联：把新文件置为 completed，复用捐赠文件的全部分片与合并产物，
- * 并对 cas_chunks / merged_blobs 做引用计数 +1。
+ * 在事务内建立秒传关联：把（可能已有部分关联的）文件置为 completed，
+ * 复用捐赠文件的全部分片与合并产物。
+ *
+ * 幂等性（修复“边算边传秒传仲裁竞态”）：
+ *   目标文件在仲裁前可能已有在途上传落了若干 file_chunks 关联，
+ *   因此对每个序号必须按「已关联同哈希 / 已关联异哈希 / 未关联」分别处理，
+ *   绝不对已存在的同哈希关联重复 ref_count+1，避免引用虚高导致 GC 永不回收。
  */
 async function linkInstantFile(conn, fileId, fileRow, donor) {
   const [donorLinks] = await conn.query(
@@ -173,32 +178,71 @@ async function linkInstantFile(conn, fileId, fileRow, donor) {
     [donor.id],
   );
 
-  // 合并产物引用 +1
-  const [mb] = await conn.query(
-    'SELECT merged_hash FROM merged_blobs WHERE merged_hash = ? FOR UPDATE',
-    [donor.merged_hash],
+  // 目标文件已有关联（仲裁前在途上传所建）
+  const [existingLinks] = await conn.query(
+    'SELECT chunk_index, chunk_hash FROM file_chunks WHERE file_id = ? FOR UPDATE',
+    [fileId],
   );
-  if (mb.length === 0) {
-    throw apiError(500, 'INSTANT_LINK_FAILED', '秒传合并产物缺失');
-  }
-  await conn.query(
-    'UPDATE merged_blobs SET ref_count = ref_count + 1 WHERE merged_hash = ?',
-    [donor.merged_hash],
-  );
+  const existingByIndex = new Map(existingLinks.map((l) => [l.chunk_index, l.chunk_hash]));
 
-  // 分片引用 +1：按捐赠文件的每个序号关联各计一次引用
-  // （同一哈希可能出现在多个序号，每个 file_chunks 行各占 1 个引用）
+  // 合并产物引用：目标已指向同一 merged blob 时不重复计数
+  if (fileRow.merged_hash !== donor.merged_hash) {
+    const [mb] = await conn.query(
+      'SELECT merged_hash FROM merged_blobs WHERE merged_hash = ? FOR UPDATE',
+      [donor.merged_hash],
+    );
+    if (mb.length === 0) {
+      throw apiError(500, 'INSTANT_LINK_FAILED', '秒传合并产物缺失');
+    }
+    // 目标若曾指向别的合并产物（极少见），先回收旧引用
+    if (fileRow.merged_hash) {
+      await conn.query(
+        'UPDATE merged_blobs SET ref_count = GREATEST(ref_count - 1, 0) WHERE merged_hash = ?',
+        [fileRow.merged_hash],
+      );
+    }
+    await conn.query(
+      'UPDATE merged_blobs SET ref_count = ref_count + 1 WHERE merged_hash = ?',
+      [donor.merged_hash],
+    );
+  }
+
+  // 捐赠分片按序号逐个对齐到目标文件
   for (const link of donorLinks) {
-    await conn.query(
-      'UPDATE cas_chunks SET ref_count = ref_count + 1 WHERE chunk_hash = ?',
-      [link.chunk_hash],
-    );
-    await conn.query(
-      `INSERT INTO file_chunks (file_id, chunk_index, chunk_hash, status)
-       VALUES (?, ?, ?, 'verified')
-       ON DUPLICATE KEY UPDATE chunk_hash = VALUES(chunk_hash), status = 'verified'`,
-      [fileId, link.chunk_index, link.chunk_hash],
-    );
+    const current = existingByIndex.get(link.chunk_index);
+    if (current === link.chunk_hash) {
+      // 已存在同序号同哈希关联（在途上传刚建好）：幂等，引用计数不动
+      await conn.query(
+        `UPDATE file_chunks SET status = 'verified'
+          WHERE file_id = ? AND chunk_index = ?`,
+        [fileId, link.chunk_index],
+      );
+    } else if (current !== undefined) {
+      // 该序号已关联别的内容：替换，旧哈希引用 -1、新哈希引用 +1
+      await conn.query(
+        `UPDATE file_chunks SET chunk_hash = ?, status = 'verified'
+          WHERE file_id = ? AND chunk_index = ?`,
+        [link.chunk_hash, fileId, link.chunk_index],
+      );
+      await conn.query(
+        'UPDATE cas_chunks SET ref_count = GREATEST(ref_count - 1, 0) WHERE chunk_hash = ?',
+        [current],
+      );
+      await conn.query(
+        'UPDATE cas_chunks SET ref_count = ref_count + 1 WHERE chunk_hash = ?',
+        [link.chunk_hash],
+      );
+    } else {
+      await conn.query(
+        'UPDATE cas_chunks SET ref_count = ref_count + 1 WHERE chunk_hash = ?',
+        [link.chunk_hash],
+      );
+      await conn.query(
+        `INSERT INTO file_chunks (file_id, chunk_index, chunk_hash, status)
+         VALUES (?, ?, ?, 'verified')`,
+        [fileId, link.chunk_index, link.chunk_hash],
+      );
+    }
   }
 
   // 新文件指向同一合并产物
@@ -716,6 +760,120 @@ router.post(
         size: body.length,
         skipped,
         dedup: casExisted,
+      });
+    } catch (err) {
+      await conn.rollback();
+      throw err;
+    } finally {
+      conn.release();
+    }
+  }),
+);
+
+/* ------------------------------------------------------------------ */
+/* POST /:fileId/chunks/:index/link  —— 只关联已有 CAS 分片，不传字节   */
+/* ------------------------------------------------------------------ */
+router.post(
+  '/:fileId/chunks/:index/link',
+  asyncHandler(async (req, res) => {
+    const fileId = safeFileId(req.params.fileId);
+    if (!/^\d+$/.test(req.params.index))
+      throw apiError(400, 'VALIDATION_ERROR', '分片序号必须为非负整数');
+    const index = Number(req.params.index);
+    const hash =
+      typeof req.query.hash === 'string' ? req.query.hash.toLowerCase() : '';
+    if (!HASH_RE.test(hash))
+      throw apiError(400, 'VALIDATION_ERROR', '查询参数 hash 必须为 64 位 sha256 hex');
+
+    const pool = getPool();
+    const conn = await pool.getConnection();
+    try {
+      await conn.beginTransaction();
+      const [files] = await conn.query(
+        'SELECT * FROM files WHERE id = ? FOR UPDATE',
+        [fileId],
+      );
+      if (files.length === 0) throw apiError(404, 'FILE_NOT_FOUND', '请先调用 /init');
+      const file = files[0];
+      if (file.status === 'completed')
+        throw apiError(409, 'FILE_ALREADY_VERIFIED', '文件已完成校验，无需再关联分片');
+      if (file.status === 'merging')
+        throw apiError(409, 'FILE_VERIFYING', '文件正在聚合校验中，禁止关联分片');
+      if (index < 0 || index >= file.total_chunks)
+        throw apiError(400, 'CHUNK_INDEX_OUT_OF_RANGE', '分片序号超出范围', {
+          index,
+          totalChunks: file.total_chunks,
+        });
+
+      // CAS 物理分片必须已存在（ref_count>0）且物理可读；不接受字节，不写盘
+      const [casRows] = await conn.query(
+        'SELECT * FROM cas_chunks WHERE chunk_hash = ? FOR UPDATE',
+        [hash],
+      );
+      if (casRows.length === 0) {
+        throw apiError(
+          409,
+          'CAS_CHUNK_NOT_FOUND',
+          '该分片内容在全局 CAS 中不存在，不能只关联，请走分片上传',
+          { index, hash },
+        );
+      }
+      const cas = casRows[0];
+      try {
+        const st = await fsp.stat(path.join(config.storageDir, cas.storage_path));
+        if (BigInt(st.size) !== BigInt(cas.chunk_size)) {
+          throw new Error('物理分片大小与记录不符');
+        }
+      } catch {
+        throw apiError(
+          409,
+          'CHUNK_FILE_MISSING',
+          'CAS 物理分片缺失或损坏，不能只关联，请走分片上传',
+          { index, hash },
+        );
+      }
+
+      const [oldLinks] = await conn.query(
+        'SELECT id, chunk_hash FROM file_chunks WHERE file_id = ? AND chunk_index = ? FOR UPDATE',
+        [fileId, index],
+      );
+
+      let skipped = false;
+      if (oldLinks.length > 0 && oldLinks[0].chunk_hash === hash) {
+        // 幂等：本文件该序号已关联同一 CAS 分片，引用计数不动
+        skipped = true;
+      } else {
+        // 新关联：CAS 引用 +1
+        await conn.query(
+          'UPDATE cas_chunks SET ref_count = ref_count + 1 WHERE chunk_hash = ?',
+          [hash],
+        );
+        if (oldLinks.length > 0) {
+          // 旧关联是不同内容：替换并回收旧引用
+          await conn.query(
+            `UPDATE file_chunks SET chunk_hash = ?, status = 'uploaded' WHERE id = ?`,
+            [hash, oldLinks[0].id],
+          );
+          await conn.query(
+            'UPDATE cas_chunks SET ref_count = GREATEST(ref_count - 1, 0) WHERE chunk_hash = ?',
+            [oldLinks[0].chunk_hash],
+          );
+        } else {
+          await conn.query(
+            `INSERT INTO file_chunks (file_id, chunk_index, chunk_hash, status)
+             VALUES (?, ?, ?, 'uploaded')`,
+            [fileId, index, hash],
+          );
+        }
+      }
+
+      await conn.commit();
+      res.status(skipped ? 200 : 201).json({
+        index,
+        hash,
+        size: Number(cas.chunk_size),
+        skipped,
+        linked: true,
       });
     } catch (err) {
       await conn.rollback();

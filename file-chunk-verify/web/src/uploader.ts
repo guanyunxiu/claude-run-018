@@ -15,6 +15,7 @@ import {
   ApiException,
   completeFile,
   initFile,
+  linkChunk,
   submitFileHash,
   uploadChunk,
 } from './api';
@@ -352,6 +353,16 @@ export async function uploadFileInChunks(
           signal,
         ).then((r) => {
           if (r.dedup) log(`分片 #${index} 命中全局 CAS 去重（物理只存一份）`);
+          return undefined;
+        }),
+      // 全局 CAS 命中：只建立本文件 file_chunks 关联（不传字节），
+      // 这是本文件能通过 complete 的必要条件
+      link: (index, hash) =>
+        withRetry(
+          () => linkChunk(fileId, index, hash, signal),
+          signal,
+        ).then(() => {
+          log(`分片 #${index} 全局 CAS 命中，只关联不传字节`);
           return undefined;
         }),
     };

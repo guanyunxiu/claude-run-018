@@ -756,5 +756,151 @@ console.log('场景 14：未完成文件下载被拒；非法 hash/fileId 返回
   check('非法 fileId 返回 400', badHash.status === 400);
 }
 
+/* ---------------- 场景 15：bug1 —— 全局 hits 只关联不传字节，否则 complete 缺片 ---------------- */
+console.log('场景 15：init.hits 命中片必须经 /link 建立本文件关联，裸跳过会 CHUNKS_INCOMPLETE');
+{
+  // 捐赠文件 D：3 个 8B 分片，全部上传完成
+  const dParts = [Buffer.from('AAAA-001'), Buffer.from('BBBB-002'), Buffer.from('CCCC-003')];
+  const dContent = Buffer.concat(dParts);
+  const dHashes = dParts.map(sha256);
+  const dAgg = sha256Text(dHashes.join(''));
+  const idD = sha256Text(`donor15:${dContent.length}:1700000006001:8`);
+  await call('POST', '/init', JSON.stringify({
+    fileId: idD, fileName: 'donor15.bin', fileSize: dContent.length, chunkSize: 8,
+    totalChunks: 3, fileHash: dAgg,
+  }), { 'Content-Type': 'application/json' });
+  for (let i = 0; i < 3; i++) {
+    await call('POST', `/${idD}/chunks/${i}?hash=${dHashes[i]}`, dParts[i]);
+  }
+  await call('POST', `/${idD}/complete`);
+
+  // 新文件 F：分片 0、2 与 D 相同（全局命中），分片 1 不同
+  const xPart = Buffer.from('XXXX-new');
+  const fParts = [dParts[0], xPart, dParts[2]];
+  const fContent = Buffer.concat(fParts);
+  const fHashes = fParts.map(sha256);
+  const fAgg = sha256Text(fHashes.join(''));
+  const idF = sha256Text(`f15:${fContent.length}:1700000006002:8`);
+  const fInit = await call('POST', '/init', JSON.stringify({
+    fileId: idF, fileName: 'f15.bin', fileSize: fContent.length, chunkSize: 8,
+    totalChunks: 3, fileHash: fAgg, chunkHashes: fHashes,
+  }), { 'Content-Type': 'application/json' });
+  check('F 非秒传（聚合哈希不同）', fInit.json.instant === false);
+  check('hits 标出全局已存在的 #0/#2',
+    fInit.json.hits[0] === fHashes[0] && fInit.json.hits[2] === fHashes[2] &&
+    fInit.json.hits[1] === undefined);
+
+  // 错误演示：一片都不关联/不上传就 complete → CHUNKS_INCOMPLETE
+  const premature = await call('POST', `/${idF}/complete`);
+  check('裸跳过 hits 直接 complete → 409 CHUNKS_INCOMPLETE（bug 复现路径）',
+    premature.status === 409 && premature.json.error.code === 'CHUNKS_INCOMPLETE');
+
+  // /link 不存在的 CAS 哈希 → 409 CAS_CHUNK_NOT_FOUND
+  const ghost = sha256(Buffer.from('never-uploaded!'));
+  const linkGhost = await call('POST', `/${idF}/chunks/0/link?hash=${ghost}`);
+  check('link 全局不存在的哈希 → 409 CAS_CHUNK_NOT_FOUND',
+    linkGhost.status === 409 && linkGhost.json.error.code === 'CAS_CHUNK_NOT_FOUND');
+
+  // #0/#2 只关联（零字节请求体）
+  const l0 = await call('POST', `/${idF}/chunks/0/link?hash=${fHashes[0]}`);
+  check('link #0 成功 201 linked=true', l0.status === 201 && l0.json.linked === true);
+  const l0again = await call('POST', `/${idF}/chunks/0/link?hash=${fHashes[0]}`);
+  check('重复 link 同哈希幂等 skipped=true 且不增加引用',
+    l0again.status === 200 && l0again.json.skipped === true);
+  // #1 走真实上传（新内容）
+  const up1 = await call('POST', `/${idF}/chunks/1?hash=${fHashes[1]}`, xPart);
+  check('差异片 #1 正常上传 201', up1.status === 201);
+  // #2 关联
+  const l2 = await call('POST', `/${idF}/chunks/2/link?hash=${fHashes[2]}`);
+  check('link #2 成功', l2.status === 201);
+
+  // 此时 F 关联齐全，complete 成功（强校验读的是共享 CAS 物理片）
+  const fDone = await call('POST', `/${idF}/complete`);
+  check('link + 差异片上传后 F complete 成功', fDone.status === 200);
+  const dlF = await fetch(`http://localhost:${port}/api/files/${idF}/download`);
+  check('F 下载内容正确（共享片来自 D）',
+    Buffer.compare(Buffer.from(await dlF.arrayBuffer()), fContent) === 0);
+
+  // 物理共享分片只存一份
+  const sharedAbs = path.join(process.env.STORAGE_DIR, 'cas', fHashes[0].slice(0, 2), `${fHashes[0]}.part`);
+  check('共享分片物理只存一份', await fsp.access(sharedAbs).then(() => true).catch(() => false));
+
+  // 删除 D：F 仍引用 #0/#2，GC 不能回收它们
+  await call('DELETE', `/${idD}`);
+  let gc = await gcCall(0);
+  check('删 D 后 GC 不回收 F 仍引用的共享片（仅 D 独有片归零）',
+    gc.json.removedChunks === 1);
+  const dlF2 = await fetch(`http://localhost:${port}/api/files/${idF}/download`);
+  check('删 D 后 F 仍可下载', dlF2.status === 200);
+  // 再删 F，剩余 2 个物理片（#0 共享、#1 新片；#2 与 #0 是不同哈希也归零）全部回收
+  await call('DELETE', `/${idF}`);
+  gc = await gcCall(0);
+  check('F 也删除后其全部引用归零，GC 回收剩余物理片', gc.json.removedChunks === 3);
+}
+
+/* ---------------- 场景 16：bug2 —— 先上传若干片再秒传，引用计数必须精确 ---------------- */
+console.log('场景 16：秒传仲裁竞态：在途片已建关联，秒传不得重复 ref_count+1（GC 应能全部回收）');
+{
+  // 捐赠文件 G（另一 fileId）完整上传：4 片
+  const gParts = [0, 1, 2, 3].map((i) => Buffer.from(`G-chunk-${i}!!`)); // 11B，统一大小
+  // 统一为 11B 以便整除：补齐
+  for (let i = 0; i < gParts.length; i++) {
+    gParts[i] = Buffer.concat([gParts[i], Buffer.alloc(0)]);
+  }
+  const gContent = Buffer.concat(gParts);
+  const gHashes = gParts.map(sha256);
+  const gAgg = sha256Text(gHashes.join(''));
+  const idG = sha256Text(`donor16:${gContent.length}:1700000007001:11`);
+  await call('POST', '/init', JSON.stringify({
+    fileId: idG, fileName: 'donor16.bin', fileSize: gContent.length, chunkSize: 11,
+    totalChunks: 4, fileHash: gAgg,
+  }), { 'Content-Type': 'application/json' });
+  for (let i = 0; i < 4; i++) {
+    await call('POST', `/${idG}/chunks/${i}?hash=${gHashes[i]}`, gParts[i]);
+  }
+  await call('POST', `/${idG}/complete`);
+
+  // 目标文件 H：先以“无哈希分阶段”init，只上传 #0、#1（模拟边算边传的在途片）
+  const idH = sha256Text(`h16:${gContent.length}:1700000007002:11`);
+  await call('POST', '/init', JSON.stringify({
+    fileId: idH, fileName: 'h16.bin', fileSize: gContent.length, chunkSize: 11,
+    totalChunks: 4, fileHash: null,
+  }), { 'Content-Type': 'application/json' });
+  await call('POST', `/${idH}/chunks/0?hash=${gHashes[0]}`, gParts[0]);
+  await call('POST', `/${idH}/chunks/1?hash=${gHashes[1]}`, gParts[1]);
+  check('H 秒传前已存在 2 个在途片关联',
+    (await call('GET', `/${idH}/chunks`)).json.chunks.length === 2);
+
+  // 此时带完整清单 init（模拟 onAllHashed 秒传仲裁）。服务端必须对 #0/#1 幂等，
+  // 只对 #2/#3 新增引用，不能把 #0/#1 重复 +1。
+  const hInstant = await call('POST', '/init', JSON.stringify({
+    fileId: idH, fileName: 'h16.bin', fileSize: gContent.length, chunkSize: 11,
+    totalChunks: 4, fileHash: gAgg, chunkHashes: gHashes,
+  }), { 'Content-Type': 'application/json' });
+  check('带清单 init 秒传成功 instant=true',
+    hInstant.status === 200 && hInstant.json.instant === true);
+  check('秒传后 H 拥有完整 4 片关联（在途 2 片被幂等吸收）',
+    hInstant.json.uploadedChunks.length === 4);
+  const dlH = await fetch(`http://localhost:${port}/api/files/${idH}/download`);
+  check('H 秒传后可下载且内容正确',
+    Buffer.compare(Buffer.from(await dlH.arrayBuffer()), gContent) === 0);
+
+  // 关键断言：删除 G、H 后，每个 CAS 分片引用必须精确归零，GC 能删除全部 4 个物理片。
+  // 若秒传对在途片重复 +1（引用虚高），这里会残留物理文件、removedChunks < 4。
+  await call('DELETE', `/${idG}`);
+  let gc = await gcCall(0);
+  check('仅删 G 时 4 个分片仍被 H 引用，GC 删除 0', gc.json.removedChunks === 0);
+  await call('DELETE', `/${idH}`);
+  gc = await gcCall(0);
+  check(`删 G+H 后引用精确归零，GC 回收全部 4 个物理片（实测 ${gc.json.removedChunks}，` +
+    '若 <4 说明秒传对在途片重复计数导致虚高)',
+    gc.json.removedChunks === 4);
+  for (let i = 0; i < 4; i++) {
+    const abs = path.join(process.env.STORAGE_DIR, 'cas', gHashes[i].slice(0, 2), `${gHashes[i]}.part`);
+    const gone = await fsp.access(abs).then(() => false).catch(() => true);
+    check(`物理片 #${i} 已从磁盘删除（引用不虚高）`, gone);
+  }
+}
+
 server.close();
 console.log(`\n全部 ${passed} 条断言通过 ✅`);

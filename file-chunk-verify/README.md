@@ -49,28 +49,38 @@ merged_blobs     合并产物：merged_hash(PK), file_size, storage_path, ref_co
 引用计数规则：
 
 - 一个 `file_chunks` 行 = 对一个 `cas_chunks` 的 1 个引用（同文件内不同序号即使哈希相同也各计 1）。
-- 上传分片：CAS 已存在则 `ref_count+1`；同文件同序号同哈希重传为幂等（撤销多加的计数）；
-  同序号不同内容则替换关联、旧哈希 `ref_count-1`。
-- 秒传：复用捐赠文件的全部分片与合并产物，所有计数 `+1`。
+- 上传分片（`POST /chunks/:i`）：CAS 已存在则 `ref_count+1`；同文件同序号同哈希重传为幂等
+  （撤销多加的计数）；同序号不同内容则替换关联、旧哈希 `ref_count-1`。
+- **只关联（`POST /chunks/:i/link?hash=`，无请求体）**：当 `init.hits` 表明某片的物理内容已在
+  全局 CAS 中存在时，前端**不发送字节**，改调 `/link` 建立本文件的 `file_chunks` 关联并
+  `ref_count+1`。注意：“CAS 里有物理片” ≠ “本 fileId 已有关联”，**绝不能因为命中 hits 就裸
+  跳过**，否则 `complete` 会 `CHUNKS_INCOMPLETE`。
+- 秒传：复用捐赠文件的全部分片与合并产物；关联建立是**幂等**的——对目标文件已存在的同序号同哈希
+  关联（边算边传时在途上传所建）不重复 `ref_count+1`，仅补齐缺失序号，杜绝引用虚高。
 - 删除文件：逐关联 `ref_count-1`、删关联行、删 files 行、合并产物 `ref_count-1`，**不删物理文件**。
 - GC：`POST /api/admin/gc` 回收 `ref_count=0` 且创建超过 `minAgeSec`（默认 300s）的物理对象，
   避免与“先写元数据后建关联”的正常首传竞争。
 
-### 秒传时序
+### 秒传 / 只关联时序
 
 ```
 客户端                              服务端
  │ init { fileHash, chunkHashes[] }  │  找 file_hash 相同且 status=completed 的捐赠文件
  │ ───────────────────────────────► │  校验：合并产物存在 + 全分片关联齐 + 物理可读
- │                                   │  复用：新 files 置 completed，分片/合并产物 ref_count+1
+ │                                   │  复用：新 files 置 completed，对“缺失序号”计数+1
+ │                                   │  （已存在的同序号同哈希关联幂等，不重复计数）
  │ ◄──── instant=true, completed ────│  → 客户端零上传，直接可下载
  │
- │ （仅部分分片命中）                 │  init 返回 hits={index:hash}（全局 CAS 已存在）
- │ ◄──── instant=false, hits ───────│  客户端只上传未命中分片；命中分片上传时返回 dedup=true
+ │ （仅部分分片命中）                 │  init 返回 hits={index:hash}（全局 CAS 已有物理片）
+ │ ◄──── instant=false, hits ───────│  命中片：POST /chunks/:i/link?hash=（只关联、零字节）
+ │                                   │  未命中片：POST /chunks/:i（上传字节）
+ │                                   │  ⚠ 命中片若不 link 也不上传，complete 会 CHUNKS_INCOMPLETE
 ```
 
-边算边传场景下，全部分片哈希算完的瞬间前端还会用“带清单 init”做一次秒传仲裁：
-若此刻服务端恰好已有完整文件（例如别人刚传完），即中止剩余上传。
+边算边传的秒传仲裁竞态：全部分片哈希算完的瞬间前端用“带清单 init”仲裁，若服务端此刻已有完整
+文件即把任务置为 `completed`；仍在途的上传/关联请求可能收到 `FILE_ALREADY_VERIFIED`，
+前端会**忽略该错误**（该文件已由秒传幂等补齐），不让整次上传失败；服务端秒传关联对这些在途片
+幂等，因此删除后引用能精确归零、GC 可彻底回收（有“先传若干片再秒传”的专门测试）。
 
 ### 与前两轮的关系
 
@@ -88,16 +98,18 @@ merged_blobs     合并产物：merged_hash(PK), file_size, storage_path, ref_co
 | `POST` | `/api/files/:fileId/hash` | 补报/锁定聚合哈希 |
 | `GET`  | `/api/files/:fileId/chunks` | 本文件已上传关联 |
 | `GET`  | `/api/files/:fileId/status` | 任务状态 |
-| `POST` | `/api/files/:fileId/chunks/:index?hash=` | 上传分片；响应新增 `dedup`（命中全局 CAS） |
+| `POST` | `/api/files/:fileId/chunks/:index?hash=` | 上传分片；响应含 `dedup`（命中全局 CAS） |
+| `POST` | `/api/files/:fileId/chunks/:index/link?hash=` | **只关联**已存在的 CAS 分片（无请求体、不传字节）；哈希不存在返回 409 `CAS_CHUNK_NOT_FOUND` |
 | `POST` | `/api/files/:fileId/complete` | 重算 CAS 分片强校验 → 流式合并（共享分片可读）→ 引用合并产物 |
 | `DELETE` | `/api/files/:fileId` | 删除文件（仅减引用，`physicalRemoved:false`） |
 | `GET`  | `/api/files/:fileId/download` | 流式下载已完成文件（读共享合并产物） |
 | `POST` | `/api/admin/gc` | 回收零引用孤儿分片/合并产物，body `{minAgeSec?}` |
 
 错误码（新增/相关）：`FILE_NOT_READY`（未完成禁止下载）、`MERGED_BLOB_MISSING`、
-`CHUNK_FILE_MISSING`（CAS 元数据指向空文件）、`FILE_HASH_REQUIRED`、`FILE_HASH_LOCKED`、
+`CHUNK_FILE_MISSING`（CAS 元数据指向空文件）、`CAS_CHUNK_NOT_FOUND`（link 的哈希在全局 CAS
+不存在，必须改走字节上传）、`FILE_HASH_REQUIRED`、`FILE_HASH_LOCKED`、
 `FILE_VERIFYING`、`FILE_ALREADY_VERIFIED`、`CHUNK_HASH_MISMATCH`、`AGGREGATE_HASH_MISMATCH`、
-`CHUNKS_INCOMPLETE`。
+`CHUNKS_INCOMPLETE`（本 fileId 缺少 `file_chunks` 关联——hits 命中片必须 `/link`，裸跳过即此错误）。
 
 ### CAS 强校验为何仍安全
 
@@ -111,13 +123,17 @@ merged_blobs     合并产物：merged_hash(PK), file_size, storage_path, ref_co
 
 ```bash
 cd server
-npm run test:e2e       # 79 条：含秒传、跨文件去重、删 A 不影响 B complete/下载、
-                       #       引用归零 GC、并发同 hash 首传幂等、篡改共享分片检出
+npm run test:e2e       # 103 条：秒传、跨文件去重、删 A 不影响 B complete/下载、引用归零 GC、
+                       #   并发同 hash 首传幂等、篡改共享分片检出、
+                       #   hits 命中片必须 /link 否则 CHUNKS_INCOMPLETE、
+                       #   先传若干片再秒传的引用计数精确性（GC 必须能全部回收）
 npm run smoke:staged   # 分阶段边传边补哈希 + 强校验（40MB）
-npm run smoke:cas      # 23 项真实 HTTP：A 正常→B 秒传零上传→C 部分去重→删除→GC 物理回收
+npm run smoke:cas      # 25 项真实 HTTP：A 正常→B 秒传零上传→C 用 link 只关联命中片+传差异片
+                       #   →无视 hits 裸跳过被 CHUNKS_INCOMPLETE 拦截→删除→GC 物理回收
 
 cd ../web
-npm run test:pipeline  # 52 条：含全局 CAS 命中跳过、秒传仲裁中止排队项、续算续传
+npm run test:pipeline  # 63 条：边算边传、有界槽位、续算续传、全局命中走 link（非裸跳过）、
+                       #   秒传仲裁中止排队项、在途请求收 FILE_ALREADY_VERIFIED 被忽略、本任务关联优先
 npm run smoke:resume   # 4GB/512 片中途刷新的复用与有界内存
 ```
 
@@ -148,8 +164,10 @@ npm run smoke:resume   # 4GB/512 片中途刷新的复用与有界内存
   │   1. IndexedDB 命中哈希？  是→复用，跳过 Worker    │
   │   2. 否→ file.slice → 单 Worker 算 SHA-256        │
   │      → 立即写 IndexedDB（游标+1，可随时刷新）      │
-  │   3. 服务端已有同哈希？ 是→跳过上传、释放槽位       │
-  │      否→进入上传队列（3 路 HTTP 并发）             │
+  │   3. 本 fileId 已有关联？ 是→彻底跳过（无请求）    │
+  │      全局 CAS 有该内容？是→POST /chunks/:i/link    │
+  │        （零字节，只建本文件关联，ref_count+1）      │
+  │      否→进入上传队列 POST /chunks/:i（raw 二进制） │
   │  POST /:id/chunks/:i?hash=xx  （raw 二进制）       │  校验大小/哈希→原子落盘→写库
   │ ───────────────────────────────────────────────► │
   │  ◄──────── 201 created / 200 skipped（幂等）       │
@@ -267,8 +285,9 @@ server/storage/
 3. 日志与进度区会显示：
    - `IndexedDB 复用 X 片`：这些片不再调用 Worker 哈希；
    - `本任务跳过 Y 片`：服务端已有该序号同哈希分片，不上传；
-   - `全局 CAS 去重 Z 片`：其它文件上传过相同内容分片，本文件也免传；
-   - 已算未传的片只读字节直接上传。
+   - `全局 CAS 去重 Z 片`：其它文件已上传过相同内容分片；本文件**不发送字节**，
+     但会调用 `/link` 建立自己的 `file_chunks` 关联（不能裸跳过，否则 complete 缺片）；
+   - 已算未传的片只读字节直接上传；全局命中片只发一个零字节的 `/link` 请求。
 4. 大样例（4GB / 512×8MB，约 30% 处刷新）实测：复用哈希 153 片、跳过上传 149 片，
    第二次只算 359 片、只传 363 片，节省约 1.16 GB 上传流量，峰值在途内存 ≤ 48MB。
    复跑：`cd web && npm run smoke:resume`。
@@ -332,23 +351,9 @@ init(fileHash+chunkHashes[])                # 直接秒传/命中判定
 
 ## 自动化测试
 
-```bash
-# 后端：79 条端到端断言（无需本机 MySQL，内置内存 mock + 真实磁盘 IO）
-cd server && npm run test:e2e
-#   覆盖：幂等/大小哈希错误/缺片/篡改检出/空文件、分阶段任务、并发 complete 抢占、
-#         相同文件秒传零上传、两文件共享分片去重、删其一另一个仍可 complete/下载、
-#         引用归零 GC 删除物理文件、并发同 hash 首传幂等且计数正确
-
-cd server && npm run smoke:staged   # 真实 HTTP：40MB 边传边补哈希 + 强校验合并
-cd server && npm run smoke:cas      # 真实 HTTP：A 上传→B 秒传→C 部分去重→删除→GC
-
-# 前端流水线：52 条纯逻辑断言
-cd web && npm run test:pipeline
-#   覆盖：边算边传、有界槽位/HTTP 并发峰值、刷新续算、已算未传直传、取消后少算少传、
-#         全局 CAS 命中跳过、全哈希就绪秒传仲裁中止排队项、缓存前缀+去重、失败冒泡、0 分片
-
-cd web && npm run smoke:resume      # 模拟 4GB（512×8MB）约 30% 处刷新的复用收益
-```
+> 最新测试清单与断言数见顶部「迭代三 · 自动化测试」（后端 `test:e2e` / `smoke:staged` /
+> `smoke:cas`，前端 `test:pipeline` / `smoke:resume`）。
+> 注意：全局 CAS 命中片在前端是调用 `/link` 建立本文件关联（非裸跳过），相关行为以迭代三为准。
 
 ## 设计要点
 

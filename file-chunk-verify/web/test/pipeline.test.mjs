@@ -95,15 +95,18 @@ function makeRemote(knownEntries = [], opts = {}) {
   const known = new Map(knownEntries);
   const skipHashes = new Set(opts.skipHashes ?? []);
   const uploaded = new Map(); // index -> hash
+  const linked = new Map(); // index -> hash（只关联、不传字节）
   const uploadOrder = [];
   let active = 0;
   let peakActive = 0;
   const failIndexes = new Set(opts.failIndexes ?? []);
   const uploadDelay = opts.uploadDelay ?? 8;
+  const linkDelay = opts.linkDelay ?? 1;
   return {
     known,
     skipHashes,
     uploaded,
+    linked,
     uploadOrder,
     get peakActive() {
       return peakActive;
@@ -120,6 +123,11 @@ function makeRemote(knownEntries = [], opts = {}) {
       assert.equal(sha256(buffer), hash, `上传内容与哈希不符 index=${index}`);
       uploaded.set(index, hash);
       active -= 1;
+    },
+    // 全局 CAS 命中：只关联本文件，不传字节
+    async link(index, hash) {
+      await new Promise((r) => setTimeout(r, linkDelay));
+      linked.set(index, hash);
     },
   };
 }
@@ -408,8 +416,8 @@ console.log('T8：0 分片直接成功返回空哈希数组');
   check('无上传', res.counters.newlyUploaded === 0);
 }
 
-/* ---------------- T9 全局 CAS 去重命中 ---------------- */
-console.log('T9：部分分片哈希在全局 CAS 已存在 → 跳过上传（跨文件去重）');
+/* ---------------- T9 全局 CAS 命中 → 只关联不传字节 ---------------- */
+console.log('T9：部分分片哈希在全局 CAS 已存在 → link 只关联（不是裸跳过），其余上传');
 {
   const total = 8;
   const reader = makeReader(total, () => CHUNK);
@@ -429,9 +437,13 @@ console.log('T9：部分分片哈希在全局 CAS 已存在 → 跳过上传（�
   });
 
   check('全局命中 2 片计数正确', res.counters.globalDedupSkipped === 2);
-  check('全局命中分片未发起上传', !remote.uploaded.has(2) && !remote.uploaded.has(5));
+  check('全局命中分片未发起字节上传', !remote.uploaded.has(2) && !remote.uploaded.has(5));
+  // 关键修复点：命中片必须建立本文件关联（link），否则 complete 会 CHUNKS_INCOMPLETE
+  check('全局命中分片通过 link 建立本文件关联',
+    remote.linked.get(2) === allHashes[2] && remote.linked.get(5) === allHashes[5]);
+  check('link 只关联了 2 片', remote.linked.size === 2);
   check('其余 6 片正常上传', remote.uploaded.size === 6);
-  check('8 片全部 settled', res.counters.settledChunks === 8);
+  check('8 片全部 settled（含 link）', res.counters.settledChunks === 8);
   check('新传计数为 6', res.counters.newlyUploaded === 6);
 }
 
@@ -482,8 +494,8 @@ console.log('T10：onAllHashed 仲裁秒传后，剩余分片不再上传');
   check('绝大多数分片未上传（至少 15 片被秒传省去）', remote.uploaded.size <= 4);
 }
 
-/* ---------------- T11 缓存前缀 + 全局命中：不读字节直接跳过 ---------------- */
-console.log('T11：缓存前缀中命中全局 CAS 的分片，不读字节、不哈希');
+/* ---------------- T11 缓存前缀 + 全局命中：不读字节不哈希，但必须 link ---------------- */
+console.log('T11：缓存前缀中命中全局 CAS 的分片，不读字节、不哈希，但建立本文件关联');
 {
   const total = 6;
   const reader = makeReader(total, () => CHUNK);
@@ -507,7 +519,85 @@ console.log('T11：缓存前缀中命中全局 CAS 的分片，不读字节、�
   check('全局命中 2 片', res.counters.globalDedupSkipped === 2);
   check('实际新传 4 片（缓存中的 #2 + 后 3 片）', res.counters.newlyUploaded === 4);
   check('6 片全 settled', res.counters.settledChunks === 6);
-  check('#0/#1 未上传', !remote.uploaded.has(0) && !remote.uploaded.has(1));
+  check('#0/#1 未走字节上传', !remote.uploaded.has(0) && !remote.uploaded.has(1));
+  check('#0/#1 通过 link 建立关联',
+    remote.linked.get(0) === allHashes[0] && remote.linked.get(1) === allHashes[1]);
+}
+
+/* ---------------- T12 秒传竞态：在途 upload 收到 FILE_ALREADY_VERIFIED 不致失败 ---------------- */
+console.log('T12：全哈希秒传仲裁后，在途上传/关联收到 FILE_ALREADY_VERIFIED 被忽略，整体成功');
+{
+  const total = 12;
+  const reader = makeReader(total, () => CHUNK);
+  const allHashes = reader.bufs.map((b) => sha256(b));
+  let uploadsRejected = 0;
+  let hookFired = false;
+  const remote = {
+    known: new Map(),
+    skipHashes: new Set(),
+    uploaded: new Map(),
+    linked: new Map(),
+    // 钩子触发后，所有尚在途的上传/关联都收到 409 FILE_ALREADY_VERIFIED
+    async upload(i, h, buf) {
+      await new Promise((r) => setTimeout(r, 25));
+      if (hookFired) {
+        uploadsRejected += 1;
+        const e = new Error('FILE_ALREADY_VERIFIED');
+        e.code = 'FILE_ALREADY_VERIFIED';
+        throw e;
+      }
+      assert.equal(sha256(buf), h);
+      this.uploaded.set(i, h);
+    },
+    async link() {
+      await new Promise((r) => setTimeout(r, 25));
+    },
+  };
+
+  const res = await runPipeline({
+    totalChunks: total,
+    hasher: { async hash(i, b) { await new Promise((r) => setTimeout(r, 1)); return sha256(b); } },
+    reader,
+    cache: makeCache(),
+    remote,
+    maxInflight: total, // 让哈希跑在前面，多数片在途时秒传
+    uploadConcurrency: 4,
+    events: {
+      onAllHashed() {
+        hookFired = true; // 模拟带清单 init 此刻把任务置为 completed
+        return 'instant';
+      },
+    },
+  });
+
+  check('返回 instantAborted=true 且未抛错', res.instantAborted === true);
+  check('确有在途上传被 409 拒绝（竞态真实发生）', uploadsRejected > 0);
+  check('12 片哈希全部完成', res.counters.hashedChunks === 12);
+}
+
+/* ---------------- T13 本任务已有关联的全局命中片不重复 link ---------------- */
+console.log('T13：init.uploadedChunks 已有的片即使 hash 也在全局集合中，仍彻底跳过');
+{
+  const total = 4;
+  const reader = makeReader(total, () => CHUNK);
+  const allHashes = reader.bufs.map((b) => sha256(b));
+  // #1 既是本任务已有关联，其哈希又出现在 skipHashes：应按“本任务已有”处理，不 link
+  const remote = makeRemote([[1, allHashes[1]]], { skipHashes: [allHashes[1], allHashes[3]] });
+  const res = await runPipeline({
+    totalChunks: total,
+    hasher: makeHasher(),
+    reader,
+    cache: makeCache(),
+    remote,
+    maxInflight: 6,
+    uploadConcurrency: 2,
+  });
+  check('#1 不 link（本任务已有关联优先）', !remote.linked.has(1));
+  check('#3 走 link（纯全局命中）', remote.linked.get(3) === allHashes[3]);
+  check('#0/#2 正常上传', remote.uploaded.size === 2);
+  check('本任务跳过计数=1，全局关联计数=1',
+    res.counters.serverSkipped === 1 && res.counters.globalDedupSkipped === 1);
+  check('4 片全 settled', res.counters.settledChunks === 4);
 }
 
 console.log(`\n流水线全部 ${passed} 条断言通过 ✅`);

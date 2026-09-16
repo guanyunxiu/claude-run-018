@@ -40,11 +40,17 @@ export interface RemoteChunks {
   known: Map<number, string>;
   /**
    * 全局 CAS 已存在的内容哈希集合（跨文件去重命中）。
-   * 生产者在一片哈希算完后若发现其 hash ∈ skipHashes，则跳过上传。
+   * 注意：这些物理分片存在 ≠ 本文件已建立关联，因此命中片必须调用 link()
+   * 建立本文件的 file_chunks 关联并让服务端 ref_count+1，而不是裸跳过。
    */
   skipHashes: Set<string>;
   /** 上传一片（内部负责重试） */
   upload(index: number, hash: string, buffer: ArrayBuffer): Promise<void>;
+  /**
+   * 关联一片已存在的全局 CAS 分片（只建 file_chunks 关联，不传字节）。
+   * 用于全局命中：本文件 complete 前必须有自己的关联，否则会 CHUNKS_INCOMPLETE。
+   */
+  link(index: number, hash: string): Promise<void>;
 }
 
 export interface PipelineEvents {
@@ -155,7 +161,10 @@ function serialized<A extends unknown[], R>(fn: (...args: A) => Promise<R>) {
 interface ReadyItem {
   index: number;
   hash: string;
-  buffer: ArrayBuffer;
+  /** 仅上传项持有字节；全局 CAS「只关联」项为 null（不读字节、不占内存槽） */
+  buffer: ArrayBuffer | null;
+  /** true=只关联已存在的 CAS 分片（link），false=需要上传字节 */
+  linkOnly: boolean;
 }
 
 export async function runPipeline(opts: PipelineOptions): Promise<PipelineResult> {
@@ -220,11 +229,20 @@ export async function runPipeline(opts: PipelineOptions): Promise<PipelineResult
   let instantAborted = false;
   let producerDone = false;
 
-  /** 判定一片是否已无需上传：本任务已有 或 全局 CAS 命中 */
-  const isSkippable = (index: number, hash: string): boolean =>
-    remote.known.get(index) === hash || remote.skipHashes.has(hash);
+  /** 本文件已有关联（无需任何网络动作） */
+  const isOwnKnown = (index: number, hash: string): boolean =>
+    remote.known.get(index) === hash;
+  /** 全局 CAS 已有该内容（需要走 link 只关联，不传字节） */
+  const isGlobalHit = (hash: string): boolean => remote.skipHashes.has(hash);
 
-  /* ---------- 生产者：顺序读片 → （缓存命中则跳过 Worker）哈希 → 入队/跳过 ---------- */
+  /** 放入一个“只关联”项：不持有字节、不占内存槽，消费者调用 remote.link */
+  const enqueueLink = (index: number, hash: string): void => {
+    counters.queued += 1;
+    readyMap.set(index, { index, hash, buffer: null, linkOnly: true });
+    readyCondition.broadcast();
+  };
+
+  /* ---------- 生产者：顺序读片 → （缓存命中则跳过 Worker）哈希 → 上传/只关联/跳过 ---------- */
   async function produce(): Promise<void> {
     try {
       for (let index = 0; index < totalChunks; index++) {
@@ -232,20 +250,33 @@ export async function runPipeline(opts: PipelineOptions): Promise<PipelineResult
 
         const fromCache = index < resumeCursor;
         const knownHash = chunkHashes[index]; // 缓存前缀已有哈希
-        // 已知哈希且可跳过（本任务/全局命中）：无需读字节、不占槽位、不占内存
-        if (knownHash !== undefined && isSkippable(index, knownHash)) {
-          counters.settledChunks += 1;
-          if (remote.known.get(index) === knownHash) counters.serverSkipped += 1;
-          else counters.globalDedupSkipped += 1;
-          counters.hashedChunks = Math.max(counters.hashedChunks, index + 1);
-          events?.onHashStart?.(index, true);
-          events?.onHashDone?.({ index, hash: knownHash, size: reader.size(index) }, true);
-          events?.onUploadStart?.(index, true);
-          events?.onUploadDone?.({ index, size: reader.size(index), skippedOnServer: true });
-          tick();
-          continue;
+
+        // 路径 A：哈希已知（本地缓存前缀），无需再算
+        if (knownHash !== undefined) {
+          if (isOwnKnown(index, knownHash)) {
+            // 本文件已有关联：彻底跳过，不读字节
+            counters.settledChunks += 1;
+            counters.serverSkipped += 1;
+            counters.hashedChunks = Math.max(counters.hashedChunks, index + 1);
+            events?.onHashStart?.(index, true);
+            events?.onHashDone?.({ index, hash: knownHash, size: reader.size(index) }, true);
+            events?.onUploadStart?.(index, true);
+            events?.onUploadDone?.({ index, size: reader.size(index), skippedOnServer: true });
+            tick();
+            continue;
+          }
+          if (isGlobalHit(knownHash)) {
+            // 全局 CAS 命中：只关联、不传字节、不读字节、不占内存槽
+            counters.hashedChunks = Math.max(counters.hashedChunks, index + 1);
+            events?.onHashStart?.(index, true);
+            events?.onHashDone?.({ index, hash: knownHash, size: reader.size(index) }, true);
+            enqueueLink(index, knownHash);
+            tick();
+            continue;
+          }
         }
 
+        // 路径 B：需要读字节（可能还要 Worker 哈希），占内存槽
         await slots.acquire(signal); // 内存闸门
         throwIfAborted(signal);
 
@@ -282,24 +313,28 @@ export async function runPipeline(opts: PipelineOptions): Promise<PipelineResult
         counters.hashedChunks = index + 1;
         events?.onHashDone?.({ index, hash, size: buffer.byteLength }, fromCache);
 
-        if (isSkippable(index, hash)) {
-          // 本任务已有 或 全局 CAS 命中：不入队，直接释放槽位
+        if (isOwnKnown(index, hash)) {
+          // 本文件已有关联：释放槽位，直接跳过
           counters.settledChunks += 1;
-          if (remote.known.get(index) === hash) counters.serverSkipped += 1;
-          else counters.globalDedupSkipped += 1;
+          counters.serverSkipped += 1;
           counters.inflight -= 1;
           events?.onUploadStart?.(index, true);
           events?.onUploadDone?.({ index, size: buffer.byteLength, skippedOnServer: true });
           slots.release();
+        } else if (isGlobalHit(hash)) {
+          // 全局命中：释放字节与内存槽，改为只关联（本文件仍需建立 file_chunks）
+          counters.inflight -= 1;
+          slots.release();
+          enqueueLink(index, hash);
         } else {
           counters.queued += 1;
-          readyMap.set(index, { index, hash, buffer });
+          readyMap.set(index, { index, hash, buffer, linkOnly: false });
           readyCondition.broadcast();
         }
         tick();
       }
 
-      // 全部分片哈希已知：秒传仲裁（此前可能已有部分分片上传，秒传意味着剩余全部免传）
+      // 全部分片哈希已知：秒传仲裁（此前可能已有部分分片上传/关联，秒传意味着剩余全部免传）
       if (chunkHashes.length === totalChunks && chunkHashes.every((h) => h !== undefined)) {
         const verdict = await events?.onAllHashed?.([...chunkHashes]);
         if (verdict === 'instant') {
@@ -338,8 +373,8 @@ export async function runPipeline(opts: PipelineOptions): Promise<PipelineResult
         break;
       }
 
-      // 同步段：推进可认领序号，跳过本任务/全局命中的片，从队列取一个就绪项。
-      // 整段无 await，保证多个消费者不会重复认领同一项。
+      // 同步段：推进可认领序号，跳过“本任务已有”的片（全局命中是 link 项，在队列里），
+      // 从队列取一个就绪项。整段无 await，保证多个消费者不会重复认领同一项。
       let item: ReadyItem | null = null;
       for (;;) {
         if (firstError) {
@@ -348,14 +383,13 @@ export async function runPipeline(opts: PipelineOptions): Promise<PipelineResult
         }
         if (instantAborted || claimCursor >= totalChunks) {
           uploadSlots.release();
-          if (instantAborted) return;
           return;
         }
         const index = claimCursor;
         if (
           chunkHashes[index] !== undefined &&
           !readyMap.has(index) &&
-          isSkippable(index, chunkHashes[index])
+          isOwnKnown(index, chunkHashes[index])
         ) {
           claimCursor += 1;
           continue;
@@ -385,20 +419,50 @@ export async function runPipeline(opts: PipelineOptions): Promise<PipelineResult
         continue;
       }
 
-      const { index, hash, buffer } = item;
-      const size = buffer.byteLength;
+      const { index, hash, buffer, linkOnly } = item;
+      const size = linkOnly ? reader.size(index) : (buffer as ArrayBuffer).byteLength;
       try {
         counters.uploading += 1;
         events?.onUploadStart?.(index, false);
         tick();
-        await remote.upload(index, hash, buffer);
+        try {
+          if (linkOnly) {
+            // 全局 CAS 命中：只建立本文件关联（不传字节）
+            await remote.link(index, hash);
+            counters.globalDedupSkipped += 1;
+          } else {
+            await remote.upload(index, hash, buffer as ArrayBuffer);
+            counters.newlyUploaded += 1;
+          }
+        } catch (err) {
+          // 秒传仲裁竞态：在途请求到达时任务已被带清单 init 置为 completed，
+          // 服务端返回 FILE_ALREADY_VERIFIED —— 此时整文件已由秒传关联完成，
+          // 在途的这一片“失败”不应让整次上传失败。
+          if (
+            instantAborted &&
+            typeof err === 'object' &&
+            err !== null &&
+            'code' in err &&
+            (err as { code?: string }).code === 'FILE_ALREADY_VERIFIED'
+          ) {
+            counters.globalDedupSkipped += linkOnly ? 1 : 0;
+          } else {
+            throw err;
+          }
+        }
         counters.uploading -= 1;
-        counters.newlyUploaded += 1;
         counters.settledChunks += 1;
-        events?.onUploadDone?.({ index, size, skippedOnServer: false });
+        events?.onUploadDone?.({
+          index,
+          size,
+          skippedOnServer: linkOnly,
+        });
       } finally {
-        counters.inflight -= 1;
-        slots.release();
+        // 只有真正持有字节的上传项占过内存槽；link 项不占
+        if (!linkOnly) {
+          counters.inflight -= 1;
+          slots.release();
+        }
         uploadSlots.release();
       }
       tick();
@@ -409,12 +473,14 @@ export async function runPipeline(opts: PipelineOptions): Promise<PipelineResult
   const consumers = Array.from({ length: uploadConcurrency }, () => consume());
   await Promise.all([producer, ...consumers]);
 
-  // 秒传中止：仍留在 readyMap 的排队项不再上传，归还其占有的内存槽位（仅记账）
+  // 秒传中止：仍留在 readyMap 的项不再处理。
+  // 上传项归还其占有的内存槽；link 项不持字节、不占槽，仅丢弃即可。
   if (instantAborted) {
     for (const [, item] of readyMap) {
-      counters.inflight -= 1;
-      slots.release();
-      void item;
+      if (!item.linkOnly) {
+        counters.inflight -= 1;
+        slots.release();
+      }
     }
     readyMap.clear();
   }
